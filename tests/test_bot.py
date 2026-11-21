@@ -1105,6 +1105,288 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_weapon_tri_priority(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["weapon_tri"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True)
+            me = o["self"]
+            x, y, z = me["pos"]
+
+            # 1. Laser prioritizes mortar enemy (0.65x) over closer gun-only enemy
+            me["weapons"] = [me["weapons"][0], {"kind": "laser", "cooldown": 0, "charge": 0,
+                                                "stats": dict(HELLO["config"]["weapons"]["laser"])}]
+            e_gun = enemy(1, (x + 80.0, y, z))
+            e_mortar = enemy(2, (x + 100.0, y, z))
+            e_mortar["weapons"] = ["gun", "mortar"]
+            o["mechs"] = [e_gun, e_mortar]
+            self.assertEqual(bot.pick_target(o, me)["id"], 2)
+
+            # 2. Lightning prioritizes charging laser (0.55x) and non-charging laser (0.72x) within 50m
+            me["weapons"] = [me["weapons"][0], {"kind": "lightning", "cooldown": 0,
+                                                "stats": dict(HELLO["config"]["weapons"]["lightning"])}]
+            e_close_gun = enemy(3, (x + 30.0, y, z))
+            e_laser = enemy(4, (x + 38.0, y, z))
+            e_laser["weapons"] = ["gun", "laser"]
+            e_laser["charging"] = False
+            o["mechs"] = [e_close_gun, e_laser]
+            self.assertEqual(bot.pick_target(o, me)["id"], 4)
+            e_laser["charging"] = True
+            e_laser["pos"] = [x + 48.0, y, z]
+            self.assertEqual(bot.pick_target(o, me)["id"], 4)
+
+            # 3. Mortar prioritizes lightning (0.75x in 16..160m) and charging laser (0.80x)
+            me["weapons"] = [me["weapons"][0], {"kind": "mortar", "cooldown": 0,
+                                                "stats": dict(HELLO["config"]["weapons"]["mortar"])}]
+            e_gun2 = enemy(5, (x + 70.0, y, z))
+            e_light = enemy(6, (x + 85.0, y, z))
+            e_light["weapons"] = ["gun", "lightning"]
+            o["mechs"] = [e_gun2, e_light]
+            self.assertEqual(bot.pick_target(o, me)["id"], 6)
+
+            e_ch_laser = enemy(7, (x + 82.0, y, z))
+            e_ch_laser["weapons"] = ["gun", "laser"]
+            e_ch_laser["charging"] = True
+            o["mechs"] = [e_gun2, e_ch_laser]
+            self.assertEqual(bot.pick_target(o, me)["id"], 7)
+
+            # 4. Flag disabled: closer gun-only enemy wins
+            B.FLAGS["weapon_tri"] = False
+            self.assertEqual(bot.pick_target(o, me)["id"], 5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_swap_slot1_sends_take_and_drop(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["weapon_tri"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 20.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+            me["weapons"] = [me["weapons"][0], mortar_w]
+
+            # Mortar (18) -> Laser (30) at feet: swaps slot 1
+            o["pickups"] = [{"id": 9101, "kind": "laser", "pos": [x + 2.0, y, z]}]
+            self.assertEqual(bot.choose_take(o, me), {"take": 9101, "drop": 1})
+
+            # Mortar (18) -> Lightning (22) in open zone (delta 4 < 6): no swap
+            bot.last_swap_t = -99.0
+            o["pickups"] = [{"id": 9102, "kind": "lightning", "pos": [x + 2.0, y, z]}]
+            self.assertEqual(bot.choose_take(o, me), {})
+
+            # Small late zone (next_radius=60): Mortar (12) -> Lightning (32) detours up to 14m, swaps at feet
+            o["zone"]["next_radius"] = 60.0
+            o["pickups"] = [{"id": 9103, "kind": "lightning", "pos": [x + 10.0, y, z]}]
+            self.assertEqual(bot.choose_take(o, me), {})
+            self.assertEqual(bot.loot_goal, (x + 10.0, y))
+
+            o["pickups"] = [{"id": 9104, "kind": "lightning", "pos": [x + 2.0, y, z]}]
+            self.assertEqual(bot.choose_take(o, me), {"take": 9104, "drop": 1})
+
+            # Active combat guard: enemy at 25m blocks even feet-swap; enemy at 40m allows feet-swap only when HP > 50%
+            bot.last_swap_t = -99.0
+            o["mechs"] = [enemy(8, (x + 25.0, y, z))]
+            self.assertEqual(bot.choose_take(o, me), {})
+            o["mechs"] = [enemy(8, (x + 40.0, y, z))]
+            me["hp"] = 600.0  # < 50%
+            self.assertEqual(bot.choose_take(o, me), {})
+            me["hp"] = 1000.0  # > 50%
+            self.assertEqual(bot.choose_take(o, me), {"take": 9104, "drop": 1})
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_no_swap_while_laser_charging(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["weapon_tri"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            # Force a large score advantage for lightning so only the laser-charging gate blocks swap
+            bot.weapon_score = lambda kind, obs: 40.0 if kind == "lightning" else 30.0
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 25.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=60.0)
+            o["mechs"] = []
+            laser_w = {"kind": "laser", "cooldown": 0.0, "charge": 0.5,
+                       "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            me["weapons"] = [me["weapons"][0], laser_w]
+            o["pickups"] = [{"id": 9201, "kind": "lightning", "pos": [x + 2.0, y, z]}]
+
+            self.assertEqual(bot.choose_take(o, me), {})
+            self.assertIsNone(bot.loot_goal)
+
+            laser_w["charge"] = 0.0
+            self.assertEqual(bot.choose_take(o, me), {"take": 9201, "drop": 1})
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_no_swap_ping_pong(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["weapon_tri"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 10.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+            me["weapons"] = [me["weapons"][0], mortar_w]
+            o["pickups"] = [{"id": 9301, "kind": "laser", "pos": [x + 2.0, y, z]}]
+
+            # Simulate recent "took" event at t=10.0
+            o["events"] = [{"type": "took", "id": 9300, "slot": 1}]
+            bot.update_memory(o)
+            o["events"] = []
+
+            # Within 4.0s cooldown: blocked
+            o["t"] = 12.5
+            self.assertEqual(bot.choose_take(o, me), {})
+            self.assertIsNone(bot.loot_goal)
+
+            # After 4.0s cooldown: allowed
+            o["t"] = 14.5
+            self.assertEqual(bot.choose_take(o, me), {"take": 9301, "drop": 1})
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_drop_ignored_when_far_early_or_contested(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["drops"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 30.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["mechs"] = []
+            cx, cy, inner = x, y, 160.0
+
+            # Far (> 85m)
+            o["drops"] = [{"id": 1, "pos": [x + 90.0, y, z], "radius": 8.0, "lands_in": 2.0, "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+
+            # Too early (lands_in > 8.0s)
+            o["drops"] = [{"id": 2, "pos": [x + 30.0, y, z], "radius": 8.0, "lands_in": 9.5, "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+
+            # Outside inner
+            o["drops"] = [{"id": 3, "pos": [x + 40.0, y, z], "radius": 8.0, "lands_in": 1.0, "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, 30.0))
+
+            # Unwinnable race against another holder (rem_cap <= eta + 0.3)
+            o["drops"] = [{"id": 4, "pos": [x + 50.0, y, z], "radius": 8.0, "lands_in": 0.0, "holder": 7, "progress": 3.2, "capture_s": 4.0}]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+
+            # Contested by 2 unique enemies within 35m (1 visible + 1 in seen)
+            o["drops"] = [{"id": 5, "pos": [x + 30.0, y, z], "radius": 8.0, "lands_in": 1.0, "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            o["mechs"] = [enemy(7, (x + 40.0, y, z))]
+            bot.seen[8] = (o["t"] - 1.0, [x + 20.0, y, z], [0.0, 0.0, 0.0])
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+
+            # 1 enemy near: rejected if low HP (< 35%), accepted if healthy
+            bot.seen.clear()
+            me["hp"] = 400.0
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+            me["hp"] = 1000.0
+            pick = bot.choose_drop(o, me, cx, cy, inner)
+            self.assertIsNotNone(pick)
+            self.assertEqual(pick[0]["id"], 5)
+
+            # Flag disabled
+            B.FLAGS["drops"] = False
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_drop_routes_with_astar_and_holds_in_ring(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["drops"] = True
+        B.FLAGS["astar_nav"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 40.0
+            me = o["self"]
+            # Start east of building prism 64, drop west of prism 64 (dist ~58.7m <= 85m)
+            mx, my = 29.5, -87.0
+            mz = WORLD.ground_z(mx, my)
+            dx, dy = -29.2, -87.0
+            dz = WORLD.ground_z(dx, dy)
+            me["pos"] = [mx, my, mz]
+            o["zone"].update(center=[0.0, -87.0], radius=300.0, next_center=[0.0, -87.0], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["events"] = []
+            o["drops"] = [{"id": 50, "pos": [dx, dy, dz], "radius": 8.0, "lands_in": 2.0, "holder": None, "progress": 0.0, "capture_s": 4.0}]
+
+            a = bot.movement(o, me)
+            self.assertGreater(math.hypot(*a["move"]), 0.5)
+            self.assertFalse(a["boost"])
+            self.assertIsNotNone(bot.nav_path)
+
+            # Inside ring (dist <= radius - 2.0): holds still even if d > settle
+            me["pos"] = [dx + 3.0, dy, dz]
+            o["zone"].update(next_center=[dx + 120.0, dy], next_radius=200.0)
+            a_hold = bot.movement(o, me)
+            self.assertEqual(a_hold["move"], [0.0, 0.0])
+
+            # Active capture hold (holding_drop): skips choose_cover even when threatened
+            o["drops"] = [{"id": 50, "pos": [dx, dy, dz], "radius": 8.0, "lands_in": 0.0,
+                           "holder": me["id"], "progress": 1.5, "capture_s": 4.0}]
+            bot.threat = (o["t"], 0.0)
+            a_cap = bot.movement(o, me)
+            self.assertEqual(a_cap["move"], [0.0, 0.0])
+            self.assertIsNone(bot.cover_goal)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_drop_evade_still_preempts_ring_hold(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["drops"] = True
+        B.FLAGS["evade"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400, energy=80.0)
+            o["t"] = 45.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            o["drops"] = [{"id": 60, "pos": [x + 1.0, y, z], "radius": 8.0, "lands_in": 0.0,
+                           "holder": me["id"], "progress": 2.5, "capture_s": 4.0}]
+            # Incoming mortar shell landing right on us
+            o["projectiles"] = [
+                {"id": 601, "kind": "mortar", "pos": [x - 60.0, y, z + 15.0], "vel": [60.0, 0.0, 5.0]}
+            ]
+            a = bot.movement(o, me)
+            self.assertTrue(bot.evading)
+            self.assertGreater(math.hypot(*a["move"]), 0.5)
+            self.assertTrue(a["boost"])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()
