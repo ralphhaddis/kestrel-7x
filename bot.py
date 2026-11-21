@@ -31,6 +31,8 @@ FLAGS = {
     "cubes": True,            # 20 m cube-seeking
     "astar_nav": True,        # Precomputed 5 m A* routing around buildings when direct path_clear fails
     "evade": True,            # dodge incoming mortar impacts and charging-laser aim rays
+    "farm_crate": True,       # safe opening crate farming when zero enemies are around
+    "mortar": True,           # closed-form ballistic mortar solver + over-building lobs
     # Keep the flags below False (verified in 48-match 1-copy bot:Bot=1 ablations against e39d414 = 9.25):
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
     "safe_laser": False,      # gate laser charge on LOS, no cover_goal, hp>140 (-0.23 pts in 1-copy sim: 9.02 vs 9.25)
@@ -77,18 +79,27 @@ class Bot:
         self.memory_s = cfg["vision"].get("memory_s", 5.0)
         self.mech_h = cfg["mech"]["height"]
         self.mech_r = cfg["mech"]["radius"]
+        self.regen_delay = float(cfg["mech"].get("regen_delay", 5.0))
         self.size_per_cube = cfg["cubes"].get("size_per_cube", 0.0)
+        self.crate_r = float(cfg.get("crates", {}).get("radius", 1.4))
+        self.crate_h = float(cfg.get("crates", {}).get("height", 2.4))
         self.npc_h = cfg["npc"]["height"]
         self.npc_r = cfg["npc"]["radius"]
         self.reach = cfg["loot"]["pickup_radius"]
         mcfg = cfg.get("weapons", {}).get("mortar", {})
-        self.mortar_g = float(mcfg.get("gravity", 22.0))
+        self.mortar_ttl = float(mcfg.get("ttl", 7.0))
+        self.mortar_speed = float(mcfg.get("speed", 72.0))
+        self.mortar_gravity = float(mcfg.get("gravity", 22.0))
+        self.mortar_g = self.mortar_gravity
         self.mortar_splash = float(mcfg.get("splash_radius", 7.0))
         self.laser_range = float(cfg.get("weapons", {}).get("laser", {}).get("range", 280.0))
 
         self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
         self.bad_pickups = {}   # pickup id -> t_expire blacklist
+        self.crate_target = None
+        self.bad_crates = {}    # crate id -> t_expire blacklist
+        self.crate_track = None  # (cid, start_t, start_hp)
         self.aggressors = {}    # attacker id -> t it last damaged us
         self.threat = None      # (t, bearing) of the last non-zone damage
         self.threat_id = None
@@ -159,12 +170,13 @@ class Bot:
                     self.cover_threats = []
             elif e.get("type") == "take_failed":
                 pid = e.get("id")
-                if pid is not None:
+                if pid is not None and e.get("reason") in ("gone", "have", "full"):
                     self.bad_pickups[pid] = t + 15.0
         cutoff = t - self.memory_s
         self.seen = {k: v for k, v in self.seen.items() if v[0] >= cutoff}
         self.aggressors = {k: v for k, v in self.aggressors.items() if v >= t - AGGRO_MEMORY_S}
         self.bad_pickups = {k: v for k, v in self.bad_pickups.items() if v > t}
+        self.bad_crates = {k: v for k, v in self.bad_crates.items() if v > t}
 
         me = obs["self"]
         if not FLAGS.get("heal", False) or not me["in_zone"]:
@@ -214,6 +226,9 @@ class Bot:
         if not FLAGS.get("loot") or None not in me["weapons"]:
             return {}
         held = {w["kind"] for w in me["weapons"] if w}
+        want_kinds = set(LOOT_PREF)
+        if FLAGS.get("mortar", True):
+            want_kinds.add("mortar")
         x, y, z = me["pos"]
         zone = obs["zone"]
         cx, cy = zone["next_center"]
@@ -229,7 +244,7 @@ class Bot:
             pid = p["id"]
             if pid in self.bad_pickups:
                 continue
-            if p["kind"] not in LOOT_PREF or p["kind"] in held:
+            if p["kind"] not in want_kinds or p["kind"] in held:
                 continue
             px, py, pz = p["pos"][0], p["pos"][1], p["pos"][2]
             d = math.hypot(px - x, py - y)
@@ -678,6 +693,75 @@ class Bot:
         should_boost = bool(me.get("grounded", True)) and (me["energy"] > 15.0) and (imminent_mortar or tight_laser)
         return best_pt, should_boost
 
+    def choose_crate(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Optional[dict]:
+        """Select a nearby ground crate to farm when zero enemies are around."""
+        if not (FLAGS.get("farm_crate", True) and me["in_zone"] and not self.late
+                and not self.evading and self.cover_goal is None
+                and me["hp"] >= me["max_hp"] - 1.0):
+            return None
+        t = obs["t"]
+        cubes = me.get("cubes", 0)
+        if not (cubes == 0 or (None in me["weapons"] and cubes < 2 and t < 90.0)):
+            return None
+        if any(m.get("kind") == "mech" for m in obs["mechs"]):
+            return None
+        if any(aid < 16 for aid in self.seen):
+            return None
+        if self.threat is not None and t - self.threat[0] < THREAT_MEMORY_S:
+            return None
+        if self.aggressors:
+            return None
+
+        x, y, z = me["pos"]
+        npcs = [m for m in obs["mechs"] if m.get("kind") == "npc"]
+        for m in npcs:
+            if math.hypot(m["pos"][0] - x, m["pos"][1] - y) <= 48.0:
+                return None
+
+        st = me["stats"]
+        mr, mh = st.get("radius"), st.get("height")
+        best = None
+        best_d = 55.0
+        for c in obs.get("crates", ()):
+            cid = c["id"]
+            if cid in self.bad_crates:
+                continue
+            px, py, pz = c["pos"][0], c["pos"][1], c["pos"][2]
+            d_xy = math.hypot(px - x, py - y)
+            if d_xy > best_d:
+                continue
+            if math.hypot(px - cx, py - cy) > inner:
+                continue
+            if abs(pz - z) > 4.0:
+                continue
+            if self.world is not None:
+                if abs(pz - self.world.ground_z(px, py)) > 2.0:
+                    continue
+                if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
+                    continue
+            if any(math.hypot(m["pos"][0] - px, m["pos"][1] - py) <= 45.0 for m in npcs):
+                continue
+            best = c
+            best_d = d_xy
+
+        if best is None:
+            self.crate_track = None
+            return None
+
+        cid = best["id"]
+        chp = best.get("hp", 300.0)
+        if self.crate_track is None or self.crate_track[0] != cid:
+            self.crate_track = (cid, t, chp)
+        else:
+            _, start_t, start_hp = self.crate_track
+            if chp < start_hp:
+                self.crate_track = (cid, t, chp)
+            elif t - start_t >= 3.5:
+                self.bad_crates[cid] = t + 30.0
+                self.crate_track = None
+                return None
+        return best
+
     def movement(self, obs: mf.Observation, me) -> dict:
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
@@ -696,6 +780,7 @@ class Bot:
         late_r = max(inner, 4.0) if zone["next_radius"] == 0 else inner
         self.late = d > late_r and (d - late_r) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
         self.evading = False
+        self.crate_target = None
         kite_boost = False
         goal = None
         evade_goal, evade_boost = self.choose_evade(obs, me, cx, cy, inner)
@@ -758,7 +843,16 @@ class Bot:
                             if cd <= best_cd and math.hypot(cp[0] - cx, cp[1] - cy) <= inner:
                                 best_cd = cd
                                 goal = (cp[0], cp[1])
-                if goal is None and cover is None and d > settle:
+                if goal is None and cover is None:
+                    crate = self.choose_crate(obs, me, cx, cy, inner)
+                    if crate is not None:
+                        self.crate_target = crate
+                        cpx, cpy = crate["pos"][0], crate["pos"][1]
+                        if math.hypot(cpx - x, cpy - y) > 5.0:
+                            goal = (cpx, cpy)
+                        else:
+                            goal = None
+                if goal is None and cover is None and self.crate_target is None and d > settle:
                     goal = (cx, cy)
 
         if goal is None:  # hold still: silent, and the gun is steadier
@@ -889,16 +983,210 @@ class Bot:
         return (abs(wrap(actual[0] - want[0])) <= max(0.01, math.atan2(0.8 * radius, dist))
                 and abs(actual[1] - want[1]) <= max(0.01, math.atan2(0.8 * half_h, dist)))
 
+    @staticmethod
+    def solve_mortar_pitch(
+        R: float,
+        dz: float,
+        v: float,
+        g: float,
+        high_arc: bool,
+        min_p: float,
+        max_p: float,
+        ttl: float,
+        r_off: float = 3.0,
+    ) -> Optional[Tuple[float, float]]:
+        """Closed-form ballistic pitch and flight time with 1-step barrel-offset refinement."""
+        if R <= 1.0 or v <= 0.0 or g <= 0.0:
+            return None
+        v2 = v * v
+        D = v2 * v2 - g * (g * R * R + 2.0 * dz * v2)
+        if D < 0.0:
+            return None
+        s = math.sqrt(D)
+        theta = math.atan2(v2 + s, g * R) if high_arc else math.atan2(v2 - s, g * R)
+        R1 = R - r_off * math.cos(theta)
+        dz1 = dz - r_off * math.sin(theta)
+        if R1 > 1.0:
+            D1 = v2 * v2 - g * (g * R1 * R1 + 2.0 * dz1 * v2)
+            if D1 < 0.0:
+                return None
+            s1 = math.sqrt(D1)
+            theta = math.atan2(v2 + s1, g * R1) if high_arc else math.atan2(v2 - s1, g * R1)
+            R_eff = R - r_off * math.cos(theta)
+        else:
+            R_eff = R
+        cos_t = math.cos(theta)
+        if cos_t <= 1e-6 or R_eff <= 0.0:
+            return None
+        t_flight = R_eff / (v * cos_t)
+        if not (min_p <= theta <= max_p) or not (0.0 < t_flight <= ttl - 0.1):
+            return None
+        return (theta, t_flight)
+
+    def mortar_arc_clear(
+        self,
+        mx: float,
+        my: float,
+        mortar_z: float,
+        r_off: float,
+        yaw: float,
+        pitch: float,
+        v: float,
+        g: float,
+        t_flight: float,
+    ) -> bool:
+        """Verify mortar parabolic trajectory clears terrain and building prisms."""
+        if self.world is None:
+            return True
+        cp = math.cos(pitch)
+        sp = math.sin(pitch)
+        ux = cp * math.cos(yaw)
+        uy = cp * math.sin(yaw)
+        uz = sp
+        sx = mx + r_off * ux
+        sy = my + r_off * uy
+        sz = mortar_z + r_off * uz
+
+        world = self.world
+        cell = world.cell
+        grid = world.grid
+        max_gz = world.max_ground_z
+
+        def hits_world(ax: float, ay: float, az: float) -> bool:
+            if az <= max_gz and az < world.ground_z(ax, ay):
+                return True
+            bucket = grid.get((int(ax // cell), int(ay // cell)))
+            if bucket:
+                for p in bucket:
+                    if p["base"] <= az <= p["top"] and world._in_prism_xy(ax, ay, p):
+                        return True
+            return False
+
+        if hits_world(sx, sy, sz):
+            return False
+
+        N = max(8, int(math.ceil(t_flight / 0.12)))
+        vx, vy, vz = v * ux, v * uy, v * uz
+        for k in range(1, N):
+            tau = t_flight * k / N
+            ax = sx + vx * tau
+            ay = sy + vy * tau
+            az = sz + vz * tau - 0.5 * g * tau * tau
+            if hits_world(ax, ay, az):
+                if tau < 0.85 * t_flight or math.hypot(ax - mx, ay - my) < 15.0:
+                    return False
+                break
+        return True
+
+    def solve_mortar(
+        self,
+        me,
+        tpos,
+        tvel,
+        mortar_w,
+        prefer_high: bool = False,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Solve damped-lead mortar (yaw, pitch, t_flight) with self-splash and arc clearance checks."""
+        mx, my, mz = me["pos"]
+        if math.hypot(tpos[0] - mx, tpos[1] - my) < 15.0:
+            return None
+        st = me["stats"]
+        mortar_z = mz + st.get("height", self.mech_h) + 0.5
+        r_off = st.get("radius", self.mech_r) + 0.5
+        min_p, max_p = st["min_pitch"], st["max_pitch"]
+        wst = mortar_w.get("stats", {})
+        v = float(wst.get("speed", self.mortar_speed))
+        g = float(wst.get("gravity", self.mortar_gravity))
+        ttl = float(wst.get("ttl", self.mortar_ttl))
+
+        arcs = (True,) if prefer_high else (False, True)
+        for high_arc in arcs:
+            px, py = tpos[0], tpos[1]
+            pz = (self.world.support_z(px, py, tpos[2]) if self.world is not None else tpos[2]) + 0.5
+            sol = None
+            for it in range(2):
+                R = math.hypot(px - mx, py - my)
+                if R < 15.0:
+                    sol = None
+                    break
+                res = self.solve_mortar_pitch(R, pz - mortar_z, v, g, high_arc, min_p, max_p, ttl, r_off=r_off)
+                if res is None:
+                    sol = None
+                    break
+                pitch, tf = res
+                if it == 0:
+                    lead_scale = 1.0 if tf <= 1.2 else max(0.35, 1.2 / tf)
+                    px = tpos[0] + tvel[0] * tf * lead_scale
+                    py = tpos[1] + tvel[1] * tf * lead_scale
+                    pz = (self.world.support_z(px, py, tpos[2]) if self.world is not None else tpos[2]) + 0.5
+                else:
+                    sol = (math.atan2(py - my, px - mx), pitch, tf)
+            if sol is not None:
+                yaw, pitch, tf = sol
+                if self.mortar_arc_clear(mx, my, mortar_z, r_off, yaw, pitch, v, g, tf):
+                    return (yaw, pitch, tf)
+        return None
+
     def combat(self, obs: mf.Observation, me) -> dict:
         weapons = me["weapons"]
         fire = [False, False]
         target = self.pick_target(obs, me) if FLAGS["fight"] else None
         gun = next((w for w in weapons if w and w["kind"] == "gun"), None)
+        laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
+        mortar = next((w for w in weapons if w and w["kind"] == "mortar"), None)
 
         if target is None:
             for i, w in enumerate(weapons):
                 if w and w["kind"] == "laser" and w.get("charge", 0) > 0:
                     fire[i] = True  # hold charge (up to hold_s) if target briefly vanished
+
+            if (FLAGS.get("fight", True) and FLAGS.get("mortar", True)
+                    and mortar is not None and mortar["cooldown"] <= 0.0
+                    and not self.healing
+                    and not (laser is not None and laser.get("charge", 0) > 0)):
+                mx, my, _ = me["pos"]
+                t_now = obs["t"]
+                best_mem = None
+                best_md = math.inf
+                for aid, (st_t, spos, svel) in self.seen.items():
+                    if aid >= 16 or (t_now - st_t) > 3.5:
+                        continue
+                    md = math.hypot(spos[0] - mx, spos[1] - my)
+                    if 18.0 <= md <= 190.0 and md < best_md:
+                        best_md = md
+                        best_mem = (aid, spos, svel)
+                if best_mem is not None:
+                    aid, spos, svel = best_mem
+                    mortar_sol = self.solve_mortar(me, spos, svel, mortar, prefer_high=True)
+                    if mortar_sol is not None:
+                        m_yaw, m_pitch, _ = mortar_sol
+                        aim = [m_yaw, min(max(m_pitch, me["stats"]["min_pitch"]), me["stats"]["max_pitch"])]
+                        actual = me["aim"]
+                        if abs(wrap(actual[0] - m_yaw)) <= 0.05 and abs(actual[1] - m_pitch) <= 0.04:
+                            for i, w in enumerate(weapons):
+                                if w and w["kind"] == "mortar":
+                                    fire[i] = True
+                        self.draw(me, spos, f"mortar mem {aid} {best_md:.0f}m")
+                        return {"aim": aim, "fire": fire}
+
+            if self.crate_target is not None and gun is not None:
+                mx, my, mz = me["pos"]
+                src = (mx, my, mz + me["stats"]["muzzle_height"])
+                cpos = self.crate_target["pos"]
+                cp = (cpos[0], cpos[1], cpos[2] + self.crate_h * 0.5)
+                dist = math.dist(src, cp)
+                direct = self.aim_at(src, cp, (0.0, 0.0, 0.0), None, me, clamp=False)
+                aim = [direct[0], min(max(direct[1], me["stats"]["min_pitch"]), me["stats"]["max_pitch"])]
+                actual = me["aim"]
+                if (self.world is None or self.world.has_los(src, cp)):
+                    for i, w in enumerate(weapons):
+                        if w and w["kind"] == "gun":
+                            fire[i] = (w.get("ammo", 0) > 0 and w.get("reload", 0) == 0
+                                       and dist <= w["stats"]["range"]
+                                       and self.aligned(actual, direct, dist, self.crate_r, self.crate_h * 0.5))
+                self.draw(me, cp, f"crate {self.crate_target['id']} {dist:.0f}m")
+                return {"aim": aim, "fire": fire}
+
             aim = self.idle_aim(obs, me)
             out = {"aim": aim, "fire": fire}
             if gun and gun.get("reload", 0) == 0 and gun.get("ammo", 0) < gun["stats"]["mag"] * 0.5:
@@ -913,23 +1201,6 @@ class Bot:
         has_los = (not FLAGS.get("los_gate", True)) or self.target_has_los
         direct = self.aim_at(src, tp, target["vel"], None, me, clamp=False)
         led = self.aim_at(src, tp, target["vel"], gun["stats"]["speed"], me, clamp=False) if gun and FLAGS["lead"] else direct
-
-        # Aim for one primary weapon: a ready/charging laser (hitscan, direct), else the gun (led).
-        laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
-        if FLAGS.get("safe_laser", False):
-            can_charge = (laser is not None and laser["cooldown"] <= 0
-                          and dist <= laser["stats"]["range"] and me["in_zone"]
-                          and has_los and self.cover_goal is None
-                          and target.get("hp", 1400.0) > 140.0
-                          and not self.late and not self.healing and not self.evading)
-        else:
-            can_charge = (laser is not None and laser["cooldown"] <= 0
-                          and dist <= laser["stats"]["range"] and me["in_zone"]
-                          and not self.late and not self.healing and not self.evading)
-        laser_primary = laser is not None and dist <= laser["stats"]["range"] and (
-            laser.get("charge", 0) > 0 or can_charge)
-        yaw, pitch = direct if laser_primary or gun is None else led
-        aim = [yaw, min(max(pitch, me["stats"]["min_pitch"]), me["stats"]["max_pitch"])]
 
         ceasefire = False
         if self.healing:
@@ -948,11 +1219,50 @@ class Bot:
                 # Let the 5s out-of-combat timer complete when damaged and enemy isn't point-blank
                 ceasefire = True
 
+        # Aim priority: laser_primary > mortar_primary > gun (led) / direct.
+        if FLAGS.get("safe_laser", False):
+            can_charge = (laser is not None and laser["cooldown"] <= 0
+                          and dist <= laser["stats"]["range"] and me["in_zone"]
+                          and has_los and self.cover_goal is None
+                          and target.get("hp", 1400.0) > 140.0
+                          and not self.late and not self.healing and not self.evading)
+        else:
+            can_charge = (laser is not None and laser["cooldown"] <= 0
+                          and dist <= laser["stats"]["range"] and me["in_zone"]
+                          and not self.late and not self.healing and not self.evading)
+        laser_primary = laser is not None and dist <= laser["stats"]["range"] and (
+            laser.get("charge", 0) > 0 or can_charge)
+
+        mortar_sol = None
+        if (FLAGS.get("mortar", True) and mortar is not None and mortar["cooldown"] <= 0.0
+                and not ceasefire and not (laser is not None and laser.get("charge", 0) > 0)):
+            dist_xy = math.hypot(target["pos"][0] - mx, target["pos"][1] - my)
+            if has_los and dist_xy >= 16.0:
+                mortar_sol = self.solve_mortar(me, target["pos"], target["vel"], mortar, prefer_high=False)
+            elif (not has_los) and dist_xy >= 18.0:
+                mortar_sol = self.solve_mortar(me, target["pos"], target["vel"], mortar, prefer_high=True)
+        mortar_primary = (not laser_primary) and (mortar_sol is not None)
+
+        if laser_primary:
+            yaw, pitch = direct
+        elif mortar_primary:
+            yaw, pitch = mortar_sol[0], mortar_sol[1]
+        elif gun is None:
+            yaw, pitch = direct
+        else:
+            yaw, pitch = led
+        aim = [yaw, min(max(pitch, me["stats"]["min_pitch"]), me["stats"]["max_pitch"])]
+
         actual = me["aim"]
         for i, w in enumerate(weapons):
             if not w:
                 continue
             k, st = w["kind"], w["stats"]
+            if k == "mortar":
+                if mortar_primary and not ceasefire:
+                    m_yaw, m_pitch, _ = mortar_sol
+                    fire[i] = abs(wrap(actual[0] - m_yaw)) <= 0.05 and abs(actual[1] - m_pitch) <= 0.04
+                continue
             if not has_los or ceasefire:
                 if k == "laser" and w.get("charge", 0) > 0:
                     fire[i] = True  # hold existing charge rather than dumping into wall
@@ -975,7 +1285,6 @@ class Bot:
                 else:
                     # full and in range: hold until on target, then let go (auto-fires after hold_s anyway)
                     fire[i] = not self.aligned(actual, direct, dist, radius, half_h)
-            # mortar: not used yet (needs ballistic aim); never taken while LOOT_PREF excludes it
 
         self.draw(me, tp, f"target {target['id']} {dist:.0f}m")
         return {"aim": aim, "fire": fire}

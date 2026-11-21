@@ -810,6 +810,301 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_take_failed_reason_blacklist(self):
+        o = make_obs(in_zone=True)
+        o["t"] = 10.0
+        o["events"] = [
+            {"type": "take_failed", "id": 101, "reason": "gone"},
+            {"type": "take_failed", "id": 102, "reason": "have"},
+            {"type": "take_failed", "id": 103, "reason": "full"},
+            {"type": "take_failed", "id": 104, "reason": "busy"},
+            {"type": "take_failed", "id": 105, "reason": "range"},
+        ]
+        self.bot.update_memory(o)
+        self.assertIn(101, self.bot.bad_pickups)
+        self.assertIn(102, self.bot.bad_pickups)
+        self.assertIn(103, self.bot.bad_pickups)
+        self.assertNotIn(104, self.bot.bad_pickups)
+        self.assertNotIn(105, self.bot.bad_pickups)
+
+    def test_farm_crate_selects_and_shoots_safe_ground_crate(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["farm_crate"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400, cubes=0)
+            o["t"] = 12.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            cx_c, cy_c = x + 20.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 2001, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+
+            # Walks toward crate when d_xy > 5.0 m
+            bot.update_memory(o)
+            am = bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.crate_target)
+            self.assertEqual(bot.crate_target["id"], 2001)
+            self.assertGreater(am["move"][0], 0.8)
+
+            # Aims at crate center and fires when aligned
+            src = (x, y, z + o["self"]["stats"]["muzzle_height"])
+            cp = (cx_c, cy_c, cz_c + bot.crate_h * 0.5)
+            want = bot.aim_at(src, cp, (0.0, 0.0, 0.0), None, o["self"], clamp=True)
+            o["self"]["aim"] = want
+            ac = bot.combat(o, o["self"])
+            self.assertTrue(ac["fire"][0])
+            self.assertAlmostEqual(ac["aim"][0], want[0], places=4)
+
+            # Off-aim: does not fire
+            o["self"]["aim"] = [B.wrap(want[0] + 0.5), want[1]]
+            self.assertFalse(bot.combat(o, o["self"])["fire"][0])
+
+            # Within 5.0 m: holds still (goal = None) even if d > settle
+            o["zone"]["next_center"] = [x + 150.0, y]
+            o["crates"] = [{"id": 2001, "pos": [x + 4.0, y, WORLD.ground_z(x + 4.0, y)], "hp": 300}]
+            am_close = bot.movement(o, o["self"])
+            self.assertEqual(am_close["move"], [0.0, 0.0])
+            self.assertIsNotNone(bot.crate_target)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_farm_crate_gates_and_filters(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["farm_crate"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400, cubes=0)
+            o["t"] = 20.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            cx_c, cy_c = x + 15.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 2010, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+
+            # Baseline selects crate
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+
+            # Damaged gate
+            o["self"]["hp"] = 1350
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["self"]["hp"] = 1400
+
+            # Visible enemy mech gate
+            o["mechs"] = [enemy(4, (x + 100.0, y, z))]
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["mechs"] = []
+
+            # Remembered enemy mech gate (aid < 16)
+            bot.seen[5] = (o["t"] - 1.0, [x + 90.0, y, z], [0.0, 0.0, 0.0])
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            bot.seen.clear()
+
+            # NPC within 48m of self rejected; NPC at 60m from self & 46m from crate allowed
+            o["mechs"] = [enemy(101, (x - 40.0, y, z), kind="npc")]
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["mechs"] = [enemy(101, (x + 50.0, y, z), kind="npc")]  # 35m from crate -> rejected
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["mechs"] = [enemy(101, (x - 60.0, y, z), kind="npc")]  # 60m from self, 75m from crate -> allowed
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["mechs"] = []
+
+            # Roof crate (pz - ground_z > 2.0) rejected
+            o["crates"] = [{"id": 2011, "pos": [cx_c, cy_c, cz_c + 6.0], "hp": 300}]
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+
+            # Goal window: cubes == 1 with empty weapon slot & t < 90 allowed, but t >= 90 rejected
+            o["crates"] = [{"id": 2010, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+            o["self"]["cubes"] = 1
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["t"] = 95.0
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+
+            # Flag disabled
+            o["t"] = 20.0
+            o["self"]["cubes"] = 0
+            B.FLAGS["farm_crate"] = False
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_farm_crate_watchdog_blacklists_stuck_crate(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["farm_crate"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400, cubes=0)
+            o["t"] = 10.0
+            x, y, _ = o["self"]["pos"]
+            o["mechs"] = []
+            cx_c, cy_c = x + 15.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 2099, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["t"] = 13.6
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            self.assertIn(2099, bot.bad_crates)
+
+            # Pruned after 30s expiry
+            o["t"] = 44.0
+            bot.update_memory(o)
+            self.assertNotIn(2099, bot.bad_crates)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_mortar_loot_pickup_flag(self):
+        old = dict(B.FLAGS)
+        try:
+            o = make_obs(in_zone=True)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=200.0)
+            o["pickups"] = [{"id": 7771, "kind": "mortar", "pos": [x + 15.0, y, z]}]
+
+            B.FLAGS["mortar"] = True
+            self.bot.choose_take(o, o["self"])
+            self.assertEqual(self.bot.loot_goal, (x + 15.0, y))
+
+            B.FLAGS["mortar"] = False
+            self.bot.choose_take(o, o["self"])
+            self.assertIsNone(self.bot.loot_goal)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_mortar_solve_pitch_exactness_and_bounds(self):
+        v, g, ttl, r_off = 72.0, 22.0, 7.0, 3.0
+        min_p, max_p = -0.7, 1.3
+        for R, dz, high in [(80.0, 0.0, False), (120.0, 8.0, False), (140.0, -5.0, True)]:
+            sol = B.Bot.solve_mortar_pitch(R, dz, v, g, high, min_p, max_p, ttl, r_off=r_off)
+            self.assertIsNotNone(sol, f"Expected solution for R={R}, dz={dz}, high={high}")
+            theta, tf = sol
+            self.assertGreaterEqual(theta, min_p)
+            self.assertLessEqual(theta, max_p)
+            self.assertGreater(tf, 0.0)
+            self.assertLessEqual(tf, ttl - 0.1)
+            # Forward kinematics check
+            hit_R = r_off * math.cos(theta) + v * math.cos(theta) * tf
+            hit_dz = r_off * math.sin(theta) + v * math.sin(theta) * tf - 0.5 * g * tf * tf
+            self.assertAlmostEqual(hit_R, R, delta=0.1)
+            self.assertAlmostEqual(hit_dz, dz, delta=0.1)
+
+        # Out-of-range and degenerate R
+        self.assertIsNone(B.Bot.solve_mortar_pitch(500.0, 0.0, v, g, False, min_p, max_p, ttl))
+        self.assertIsNone(B.Bot.solve_mortar_pitch(0.5, 0.0, v, g, False, min_p, max_p, ttl))
+
+    def test_mortar_self_splash_guard_and_damped_lead(self):
+        bot = B.Bot(copy.deepcopy(HELLO))
+        bot.world = None
+        o = make_obs(in_zone=True)
+        me = o["self"]
+        x, y, z = me["pos"]
+        mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+
+        # Raw distance < 15 m rejected
+        self.assertIsNone(bot.solve_mortar(me, [x + 12.0, y, z], [0.0, 0.0, 0.0], mortar_w))
+        # Target at 18 m rushing toward us -> predicted < 15 m rejected
+        self.assertIsNone(bot.solve_mortar(me, [x + 18.0, y, z], [-20.0, 0.0, 0.0], mortar_w))
+
+        # Moving target at 80 m: yaw leads north (+y)
+        sol = bot.solve_mortar(me, [x + 80.0, y, z], [0.0, 12.0, 0.0], mortar_w)
+        self.assertIsNotNone(sol)
+        self.assertGreater(sol[0], 0.05)
+
+    def test_mortar_over_building_lob_and_arc_clear(self):
+        bot = B.Bot(copy.deepcopy(HELLO))
+        o = make_obs(in_zone=True)
+        me = o["self"]
+        mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+        me["weapons"] = [me["weapons"][0], mortar_w]
+
+        # Position east of building prism 64 (-9.2..21.5 x -96..-78), enemy west at 140m (no LOS)
+        mx, my = 45.0, -87.0
+        mz = WORLD.ground_z(mx, my)
+        ex, ey = -95.0, -87.0
+        ez = WORLD.ground_z(ex, ey)
+        me["pos"] = [mx, my, mz]
+        muzzle_h = me["stats"]["muzzle_height"]
+        self.assertFalse(WORLD.has_los((mx, my, mz + muzzle_h), (ex, ey, ez + 4.5)))
+
+        # Flat arc blocked by building prism 64, high arc clears over it
+        sol_high = bot.solve_mortar(me, [ex, ey, ez], [0.0, 0.0, 0.0], mortar_w, prefer_high=True)
+        self.assertIsNotNone(sol_high)
+        m_yaw, m_pitch, _ = sol_high
+        self.assertGreater(m_pitch, 0.8)
+
+        # In combat(), enemy without LOS still gets aimed and fired at by mortar when aligned
+        o["mechs"] = [enemy(7, (ex, ey, ez))]
+        bot.update_memory(o)
+        me["aim"] = [m_yaw, m_pitch]
+        ac = bot.combat(o, me)
+        self.assertEqual(ac["fire"], [False, True])
+
+    def test_mortar_combat_priority_cooldown_and_memory_lob(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["mortar"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True)
+            o["t"] = 30.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+            me["weapons"] = [me["weapons"][0], mortar_w]
+
+            # Ready mortar aims ballistic pitch (> gun pitch) and fires when aligned
+            o["mechs"] = [enemy(7, (x + 100.0, y, z))]
+            a1 = bot.combat(o, me)
+            self.assertGreater(a1["aim"][1], 0.08)
+            me["aim"] = a1["aim"]
+            a2 = bot.combat(o, me)
+            self.assertTrue(a2["fire"][1])
+
+            # On cooldown: never steals aim from gun
+            mortar_w["cooldown"] = 1.5
+            a_cd = bot.combat(o, me)
+            self.assertLess(a_cd["aim"][1], 0.0)
+            me["aim"] = a_cd["aim"]
+            a_cd2 = bot.combat(o, me)
+            self.assertEqual(a_cd2["fire"], [True, False])
+
+            # Remembered enemy lob when target is None (age <= 3.5s, 18 <= dist <= 190)
+            mortar_w["cooldown"] = 0.0
+            o["mechs"] = []
+            bot.seen = {7: (o["t"] - 1.5, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
+            a_mem = bot.combat(o, me)
+            self.assertGreater(a_mem["aim"][1], 0.8)
+            me["aim"] = a_mem["aim"]
+            a_mem2 = bot.combat(o, me)
+            self.assertEqual(a_mem2["fire"], [False, True])
+
+            # Stale memory (> 3.5s) does not fire
+            bot.seen = {7: (o["t"] - 4.0, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
+            a_stale = bot.combat(o, me)
+            self.assertEqual(a_stale["fire"], [False, False])
+
+            # Disabled flag: mortar does not fire
+            B.FLAGS["mortar"] = False
+            o["mechs"] = [enemy(7, (x + 80.0, y, z))]
+            me["aim"] = [0.0, 0.0]
+            a_off = bot.combat(o, me)
+            self.assertFalse(a_off["fire"][1])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()
