@@ -1613,6 +1613,60 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_rear_guard_preserves_laser_charge_aim(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["rear_guard"] = True
+        B.FLAGS["laser_opt"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=False, hp=1400.0, max_hp=1400.0)
+            mx, my, mz = o["self"]["pos"]
+            laser_st = dict(HELLO["config"]["weapons"]["laser"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": 0.45, "stats": laser_st},
+            ]
+            # Target directly east (+X), occluded, with a rear threat directly west (-X)
+            e = enemy(7, (mx + 60.0, my, mz))
+            o["mechs"] = [e]
+            bot.threat = (o["t"], math.pi)
+            bot.target_has_los = False
+            act = bot.combat(o, o["self"])
+            # Rear guard must NOT hijack aim to pi while laser has active charge
+            self.assertLess(abs(B.wrap(act["aim"][0] - 0.0)), 0.3)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_laser_cookoff_early_release_vs_mortar_carrier(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["laser_opt"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            mx, my, mz = o["self"]["pos"]
+            laser_st = dict(HELLO["config"]["weapons"]["laser"])
+            # At charge=0.35 (full=0.75, min_frac=0.35, dmg=315): base est_dmg ~ 206; with cookoff 0.6 -> ~330
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": 0.35, "stats": laser_st},
+            ]
+            e = enemy(7, (mx + 50.0, my, mz))
+            e["hp"] = 280.0
+            e["weapons"] = ["gun"]
+            o["mechs"] = [e]
+            o["self"]["aim"] = [0.0, 0.0]
+            bot.target_has_los = True
+            act_gun = bot.combat(o, o["self"])
+            self.assertTrue(act_gun["fire"][1], "Should keep charging against 280 HP gun-only target")
+
+            e["weapons"] = ["gun", "mortar"]
+            act_mortar = bot.combat(o, o["self"])
+            self.assertFalse(act_mortar["fire"][1], "Should early-release laser against 280 HP mortar carrier via cookoff")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()

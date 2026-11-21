@@ -500,6 +500,12 @@ class Bot:
                 exposed_threats.append(te)
             else:
                 unexposed_threats.append(te)
+        if len(exposed_threats) > 6:
+            exposed_threats.sort(key=lambda te: (te[0] - x) ** 2 + (te[1] - y) ** 2)
+            exposed_threats = exposed_threats[:6]
+        if len(unexposed_threats) > 6:
+            unexposed_threats.sort(key=lambda te: (te[0] - x) ** 2 + (te[1] - y) ** 2)
+            unexposed_threats = unexposed_threats[:6]
         self.cover_exposed = bool(exposed_threats)
         if pursuing:
             gx, gy = self.cover_goal
@@ -516,8 +522,8 @@ class Bot:
 
         base_angle = math.atan2(cy - y, cx - x)
         radii = (12.0, 24.0, 36.0, 48.0) if FLAGS.get("proactive_cover", False) else (12.0, 24.0, 36.0)
-        n_threats = len(threats)
         n_exposed = len(exposed_threats)
+        n_threats = n_exposed + len(unexposed_threats)
 
         best_pos: Optional[Tuple[float, float]] = None
         best_score = -math.inf
@@ -1562,6 +1568,8 @@ class Bot:
                         me.get("cubes", 0), int(cubes_cfg.get("stat_cap", 10))
                     )
                     est_dmg = st["damage"] * (min_frac + (1.0 - min_frac) * min(1.0, charge / full_charge)) * cube_scale
+                    if "mortar" in (target.get("weapons") or ()):
+                        est_dmg *= 1.0 + float(st.get("cookoff", 0.6))
                     if (FLAGS.get("laser_opt", True) and dist <= st["range"]
                             and charge >= min_charge and is_aligned
                             and target.get("hp", 1400.0) <= est_dmg):
@@ -1572,7 +1580,8 @@ class Bot:
                         # full and in range: hold until on target, then let go (auto-fires after hold_s anyway)
                         fire[i] = not is_aligned
 
-        if FLAGS.get("rear_guard", True) and not any(fire) and not has_los and not mortar_primary:
+        if (FLAGS.get("rear_guard", True) and not any(fire) and not has_los and not mortar_primary
+                and not (laser is not None and laser.get("charge", 0) > 0)):
             zone = obs["zone"]
             cx, cy = zone["next_center"]
             d_next = math.hypot(cx - mx, cy - my)
