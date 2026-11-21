@@ -1,0 +1,6 @@
+.git
+kit
+tests
+scripts
+**/__pycache__
+*.md
