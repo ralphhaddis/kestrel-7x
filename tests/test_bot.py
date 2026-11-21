@@ -535,6 +535,37 @@ class Decisions(unittest.TestCase):
             B.FLAGS["sound"] = old_sound
             B.FLAGS["heal"] = old_heal
 
+    def test_proactive_cover_combat_strafe_and_selective_fire(self):
+        bot = B.Bot(copy.deepcopy(HELLO))
+        # 1. Selective fire: during a full act() step with alive > 4, unprovoked full-HP enemy at 120m holds fire
+        o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+        o["t"] = 15.0
+        o["alive"] = 12
+        o["events"] = []
+        x, y, z = o["self"]["pos"]
+        o["self"]["aim"] = [0.0, 0.0]
+        o["mechs"] = [enemy(14, (x + 120.0, y, z))]
+        a_unprov = bot.act(copy.deepcopy(o))
+        self.assertEqual(a_unprov["fire"], [False, False])
+
+        # Finishable low-HP enemy at 120m breaks selective_fire ceasefire
+        o_low = copy.deepcopy(o)
+        o_low["mechs"][0]["hp"] = 300
+        a_finish = bot.act(o_low)
+        self.assertTrue(a_finish["fire"][0])
+
+        # 2. Combat strafe: when exposed to an enemy at 80m in open ground with no cover, never stands still
+        bot2 = B.Bot(copy.deepcopy(HELLO))
+        bot2.world = None
+        o_strafe = make_obs(in_zone=True, hp=1400, max_hp=1400)
+        cx, cy = o_strafe["zone"]["next_center"]
+        o_strafe["self"]["pos"] = [cx, cy, 0.0]
+        o_strafe["zone"]["next_radius"] = 300.0
+        o_strafe["mechs"] = [enemy(9, (cx + 80.0, cy, 0.0))]
+        o_strafe["events"] = []
+        a_st = bot2.act(o_strafe)
+        self.assertGreater(math.hypot(*a_st["move"]), 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

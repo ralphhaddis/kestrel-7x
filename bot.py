@@ -17,16 +17,19 @@ import mechfight as mf
 import world_map as wm
 
 FLAGS = {
-    "loot": True,      # detour to and take weapon pickups (kinds in LOOT_PREF)
-    "fight": True,     # aim at and shoot enemies
-    "lead": True,      # lead moving targets by projectile flight time (gun)
-    "cover": True,     # seek cover when inside the zone and threatened
-    "los_gate": True,  # gate fire[i] on world.has_los(src, tp)
-    "heal": False,     # 1-variable experiment: HEAL_COVER ceasefire when low HP
-    "kite": False,     # 1-variable experiment: perimeter settle + open-field kiting
-    "cubes": True,     # 20 m cube-seeking
-    "sound": False,    # 1-variable experiment: face recent "near" sounds in idle_aim
-    "debug": True,     # attach debug drawings (never affects the match)
+    "loot": True,             # detour to and take weapon pickups (kinds in LOOT_PREF)
+    "fight": True,            # aim at and shoot enemies
+    "lead": True,             # lead moving targets by projectile flight time (gun)
+    "cover": True,            # seek cover when inside the zone and threatened
+    "los_gate": True,         # gate fire[i] on world.has_los(src, tp)
+    "heal": True,             # HEAL_COVER ceasefire when low HP
+    "kite": True,             # perimeter settle + open-field kiting
+    "cubes": True,            # 20 m cube-seeking
+    "sound": True,            # face recent "near" sounds in idle_aim
+    "proactive_cover": True,  # seek cover proactively (healing, outnumbered, charging laser, reloading)
+    "combat_strafe": True,    # juking combat strafe + weapon spacing + laser dodge when exposed
+    "selective_fire": True,   # avoid initiating unprovoked distant poke fights
+    "debug": True,            # attach debug drawings (never affects the match)
 }
 
 # Upgrade ids in order of preference; anything not listed is only taken as the server's choice 0.
@@ -77,6 +80,7 @@ class Bot:
         self.last_sound: Optional[Tuple[float, float]] = None
         self.healing = False
         self.last_damaged_t = -99.0
+        self.last_move_t = -99.0
         self.late = False
         self.target_has_los = True
         self.last_t = None
@@ -88,6 +92,7 @@ class Bot:
         self.stuck_s = 0.0
         self.unstick_until = -1.0
         self.unstick_side = 1
+        self.strafe_flip_t = 0.0
         mf.log(f"{self.name}: slot {hello['slot']} seed {hello['seed']}")
 
     # ------------------------------------------------------------------ main step
@@ -231,7 +236,16 @@ class Bot:
         t = obs["t"]
         recent_hit = self.threat is not None and t - self.threat[0] < THREAT_MEMORY_S
         pursuing = self.cover_goal is not None and t < self.cover_until
-        if not (recent_hit or pursuing):
+
+        proactive = False
+        if FLAGS.get("proactive_cover", False):
+            gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+            reloading = gun is not None and gun.get("reload", 0) > 0.3
+            enemy_charging = any(m.get("charging") for m in obs["mechs"] if m.get("kind") == "mech")
+            vis_enemies = [m for m in obs["mechs"] if m.get("kind") == "mech"]
+            proactive = self.healing or reloading or enemy_charging or len(vis_enemies) >= 2
+
+        if not (recent_hit or pursuing or proactive):
             self.cover_goal = None
             return None
 
@@ -252,13 +266,14 @@ class Bot:
                     and self.world.path_clear(me["pos"], (gx, gy, gz), radius=mr, height=mh)):
                 self.cover_threats = threats
                 return self.cover_goal
-        if not recent_hit or not exposed_threats or (self.cover_goal is None and t < self.cover_until):
+        if not (recent_hit or proactive) or not exposed_threats or (self.cover_goal is None and t < self.cover_until):
             self.cover_goal = None
             return None
 
         base_angle = math.atan2(cy - y, cx - x)
         candidates: List[Tuple[float, float]] = []
-        for r in (12.0, 24.0, 36.0):
+        radii = (12.0, 24.0, 36.0, 48.0) if FLAGS.get("proactive_cover", False) else (12.0, 24.0, 36.0)
+        for r in radii:
             for k in range(12):
                 ang = base_angle + TAU * k / 12.0
                 candidates.append((x + r * math.cos(ang), y + r * math.sin(ang)))
@@ -306,12 +321,13 @@ class Bot:
 
         nt = min(exposed_threats, key=lambda te: math.hypot(te[0] - x, te[1] - y))
         td = math.hypot(nt[0] - x, nt[1] - y)
-        if not (td < 55.0 or len(exposed_threats) >= 2 or self.healing):
+        kite_dist = 85.0 if FLAGS.get("combat_strafe", False) else 55.0
+        if not (td < kite_dist or len(exposed_threats) >= 2 or self.healing):
             return None, td
         tb = math.atan2(nt[1] - y, nt[0] - x)
         step_r = 16.0
         cur_dc = math.hypot(x - cx, y - cy)
-        max_dc = max(cur_dc, inner * 0.75)
+        max_dc = max(cur_dc + 6.0, inner) if FLAGS.get("combat_strafe", False) else max(cur_dc, inner * 0.75)
 
         away = tb + math.pi
         angles = [away, away + 0.5, away - 0.5, away + 1.0, away - 1.0, away + 1.5, away - 1.5]
@@ -328,15 +344,93 @@ class Bot:
             if not self.world.path_clear(me["pos"], (kx, ky, kz), radius=mr, height=mh):
                 continue
             d_threat = math.hypot(kx - nt[0], ky - nt[1])
-            score = d_threat - 0.45 * d_center - 1.5 * idx
+            breaks_los = not self.world.has_los((kx, ky, kz + eye_h), nt)
+            score = d_threat + (35.0 if breaks_los else 0.0) - 0.35 * d_center - 1.5 * idx
             if score > best_score:
                 best_score = score
                 best_pt = (kx, ky)
         return best_pt, td
 
+    def choose_combat_strafe(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Tuple[Optional[Tuple[float, float]], bool]:
+        """Lateral juking strafe + weapon spacing + charging-laser evade when exposed in combat."""
+        if not (FLAGS.get("combat_strafe", False) and me["in_zone"] and inner > 3.0):
+            return None, False
+        x, y, z = me["pos"]
+        t = obs["t"]
+        st = me["stats"]
+        eye_h = st.get("eye_height", 8.0)
+        mr, mh = st.get("radius"), st.get("height")
+        me_eye = (x, y, z + eye_h)
+
+        # Find closest visible enemy mech with LOS (or charging laser)
+        vis_mechs = []
+        charging_threat = None
+        for m in obs["mechs"]:
+            if m.get("kind") != "mech":
+                continue
+            ep = m["pos"]
+            e_eye = (ep[0], ep[1], ep[2] + 8.0)
+            if self.world is None or self.world.has_los(me_eye, e_eye):
+                d = math.hypot(ep[0] - x, ep[1] - y)
+                if d <= 145.0:
+                    vis_mechs.append((d, m))
+                    if m.get("charging"):
+                        charging_threat = m
+        if not vis_mechs:
+            return None, False
+
+        vis_mechs.sort(key=lambda item: item[0])
+        ed, enemy_m = vis_mechs[0]
+        ep = enemy_m["pos"]
+        tb = math.atan2(ep[1] - y, ep[0] - x)
+
+        # Periodically flip strafe direction to defeat linear velocity-lead aiming
+        if t >= self.strafe_flip_t:
+            self.unstick_side = -self.unstick_side
+            self.strafe_flip_t = t + 0.55
+
+        # Desired weapon range spacing (kyoto-max style)
+        held = {w["kind"]: w for w in me["weapons"] if w}
+        enemy_weapons = set(enemy_m.get("weapons") or ())
+        if "lightning" in enemy_weapons and "lightning" not in held:
+            want_d = 75.0
+        elif "lightning" in held and me["energy"] >= 25.0 and ed < 55.0:
+            want_d = 24.0
+        elif "laser" in held:
+            want_d = 95.0
+        else:
+            want_d = 62.0
+
+        radial = max(-0.65, min(0.65, (ed - want_d) / 25.0))
+        for side in (self.unstick_side, -self.unstick_side):
+            perp = tb + side * math.pi * 0.5
+            ux = math.cos(perp) + radial * math.cos(tb)
+            uy = math.sin(perp) + radial * math.sin(tb)
+            norm = math.hypot(ux, uy) or 1.0
+            dx, dy = ux / norm, uy / norm
+            sx, sy = x + 8.0 * dx, y + 8.0 * dy
+            if math.hypot(sx - cx, sy - cy) > inner:
+                # Bias inward toward next_center near zone edge
+                in_yaw = math.atan2(cy - y, cx - x)
+                dx = 0.5 * dx + 0.5 * math.cos(in_yaw)
+                dy = 0.5 * dy + 0.5 * math.sin(in_yaw)
+                norm = math.hypot(dx, dy) or 1.0
+                dx, dy = dx / norm, dy / norm
+                sx, sy = x + 8.0 * dx, y + 8.0 * dy
+            if self.world is not None:
+                sz = self.world.support_z(sx, sy, z)
+                if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
+                        and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
+                    continue
+            self.unstick_side = side
+            dodge_boost = charging_threat is not None and me["energy"] > 20.0
+            return (x + dx, y + dy), dodge_boost
+        return None, False
+
     def movement(self, obs: mf.Observation, me) -> dict:
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
+        self.last_move_t = t
         zone = obs["zone"]
         cx, cy = zone["next_center"]
         d = math.hypot(cx - x, cy - y)
@@ -370,6 +464,9 @@ class Bot:
                 elif self.threat and t - self.threat[0] < THREAT_MEMORY_S:
                     # Post-hit strafe fallback when no cover building is nearby, checked against walls.
                     bearing = self.threat[1]
+                    if FLAGS.get("combat_strafe", False) and t >= self.strafe_flip_t:
+                        self.unstick_side = -self.unstick_side
+                        self.strafe_flip_t = t + 0.55
                     dx, dy = -math.sin(bearing), math.cos(bearing)
                     if self.unstick_side < 0:
                         dx, dy = -dx, -dy
@@ -385,16 +482,21 @@ class Bot:
                         goal = (x + dx, y + dy)
                     else:
                         goal = (cx, cy)
-                elif self.loot_goal is not None:
-                    goal = self.loot_goal
-                elif FLAGS.get("cubes", True) and me.get("cubes", 0) < self.cfg["cubes"]["stat_cap"]:
-                    candidates = [c["pos"] for c in obs["cubes"]
-                                  if abs(c["pos"][2] - me["pos"][2]) <= 4
-                                  and math.dist(c["pos"][:2], (cx, cy)) <= inner
-                                  and math.dist(c["pos"][:2], (x, y)) <= 20]
-                    if candidates:
-                        best_c = min(candidates, key=lambda pos: math.dist(pos[:2], (x, y)))
-                        goal = (best_c[0], best_c[1])
+                else:
+                    strafe_goal, strafe_boost = self.choose_combat_strafe(obs, me, cx, cy, inner)
+                    if strafe_goal is not None:
+                        goal = strafe_goal
+                        kite_boost = strafe_boost
+                    elif self.loot_goal is not None:
+                        goal = self.loot_goal
+                    elif FLAGS.get("cubes", True) and me.get("cubes", 0) < self.cfg["cubes"]["stat_cap"]:
+                        candidates = [c["pos"] for c in obs["cubes"]
+                                      if abs(c["pos"][2] - me["pos"][2]) <= 4
+                                      and math.dist(c["pos"][:2], (cx, cy)) <= inner
+                                      and math.dist(c["pos"][:2], (x, y)) <= 20]
+                        if candidates:
+                            best_c = min(candidates, key=lambda pos: math.dist(pos[:2], (x, y)))
+                            goal = (best_c[0], best_c[1])
                 if goal is None and cover is None and d > settle:
                     goal = (cx, cy)
 
@@ -524,6 +626,18 @@ class Bot:
         ceasefire = False
         if self.healing:
             if not ((has_los and dist <= 35.0) or (obs["t"] - self.last_damaged_t) <= 0.5):
+                ceasefire = True
+        if not ceasefire and FLAGS.get("selective_fire", False):
+            t_now = obs["t"]
+            recent_hit = self.threat is not None and t_now - self.threat[0] < THREAT_MEMORY_S
+            provoked = target["id"] in self.aggressors or recent_hit
+            finishable = target.get("hp", 1400.0) <= 550.0
+            in_full_step = self.last_move_t == t_now
+            max_unprovoked_d = 58.0 if (in_full_step and obs.get("alive", 16) > 4) else 108.0
+            if not provoked and not finishable and dist > max_unprovoked_d:
+                ceasefire = True
+            elif not provoked and not finishable and me["hp"] < me["max_hp"] and (t_now - self.last_damaged_t) < 5.2 and dist > 45.0:
+                # Let the 5s out-of-combat timer complete when damaged and enemy isn't point-blank
                 ceasefire = True
 
         actual = me["aim"]
