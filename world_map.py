@@ -319,38 +319,6 @@ class WorldMap:
                 return False
         return True
 
-    def _blocks_ray(self, p, x, y, z, dx, dy, dz):
-        # Clip the segment to the prism's bounding box, including its vertical slab.
-        lo, hi = 0.0, 1.0
-        xmin, ymin, xmax, ymax = p["bbox"]
-        for start, delta, low, high in ((x, dx, xmin, xmax), (y, dy, ymin, ymax),
-                                        (z, dz, p["base"], p["top"])):
-            if delta == 0:
-                if start < low or start > high:
-                    return False
-                continue
-            a, b = (low - start) / delta, (high - start) / delta
-            lo, hi = max(lo, min(a, b)), min(hi, max(a, b))
-            if lo > hi:
-                return False
-        mid = (lo + hi) * 0.5
-        if self._in_prism_xy(x + mid * dx, y + mid * dy, p):
-            return True
-        # A ray can enter and exit the footprint on the same side of the midpoint.
-        for ring in (p["poly"], *p["holes"]):
-            ax, ay = ring[-1]
-            for bx, by in ring:
-                ex, ey = bx - ax, by - ay
-                det = dx * ey - dy * ex
-                if det:
-                    rx, ry = ax - x, ay - y
-                    t = (rx * ey - ry * ex) / det
-                    u = (rx * dy - ry * dx) / det
-                    if lo <= t <= hi and 0 <= u <= 1:
-                        return True
-                ax, ay = bx, by
-        return False
-
     def has_los(
         self,
         a_xyz: Tuple[float, float, float],
@@ -368,7 +336,7 @@ class WorldMap:
             return True
 
         eff_step = min(float(step), 3.0) if step > 0.0 else 3.0
-        steps = max(2, int(math.ceil(dist_3d / eff_step)))
+        steps = max(4, int(math.ceil(dist_3d / eff_step)))
         inv = 1.0 / steps
         sx = dx * inv
         sy = dy * inv
@@ -376,28 +344,16 @@ class WorldMap:
 
         cell = self.cell
         grid = self.grid
-        # Visit every grid cell crossed in each x-column, even at a corner.
-        checked = set()
-        for gx in range(math.floor(min(ax, bx) / cell), math.floor(max(ax, bx) / cell) + 1):
-            if dx:
-                a = (gx * cell - ax) / dx
-                b = ((gx + 1) * cell - ax) / dx
-                y0 = ay + dy * max(0.0, min(a, b))
-                y1 = ay + dy * min(1.0, max(a, b))
-            else:
-                y0, y1 = ay, by
-            for gy in range(math.floor(min(y0, y1) / cell), math.floor(max(y0, y1) / cell) + 1):
-                for p in grid.get((gx, gy), ()):
-                    if p["id"] in checked:
-                        continue
-                    checked.add(p["id"])
-                    if self._blocks_ray(p, ax, ay, az, dx, dy, dz):
-                        return False
         x, y, z = ax, ay, az
         for _ in range(1, steps):
             x += sx
             y += sy
             z += sz
+            bucket = grid.get((int(x // cell), int(y // cell)))
+            if bucket:
+                for p in bucket:
+                    if p["base"] <= z <= p["top"] and self._in_prism_xy(x, y, p):
+                        return False
             if z < self.ground_z(x, y):
                 return False
         return True
