@@ -877,6 +877,7 @@ class Decisions(unittest.TestCase):
     def test_farm_crate_gates_and_filters(self):
         old = dict(B.FLAGS)
         B.FLAGS["farm_crate"] = True
+        B.FLAGS["farm_ext"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400, max_hp=1400, cubes=0)
@@ -1266,6 +1267,7 @@ class Decisions(unittest.TestCase):
     def test_drop_ignored_when_far_early_or_contested(self):
         old = dict(B.FLAGS)
         B.FLAGS["drops"] = True
+        B.FLAGS["farm_ext"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400, max_hp=1400)
@@ -1859,6 +1861,306 @@ class Decisions(unittest.TestCase):
             a_rel = bot.combat(o2, o2["self"])
             self.assertEqual(a_rel["fire"], [False, False])
             self.assertAlmostEqual(a_rel["aim"][0], 1.8, places=5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_beam_intel_injects_unseen_shooter_and_ignores_self_or_visible(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["beam_intel"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400, cubes=0)
+            o["t"] = 40.0
+            my_id = o["self"]["id"]
+            x, y, z = o["self"]["pos"]
+            o["mechs"] = [enemy(7, (x + 50.0, y, z))]
+            o["beams"] = [
+                {"kind": "laser", "by": my_id, "age": 0.1, "path": [[x, y, z + 7.0], [x + 50.0, y, z + 7.0]]},
+                {"kind": "laser", "by": 7, "age": 0.1, "path": [[x + 50.0, y + 10.0, z + 7.0], [x, y, z + 7.0]]},
+                {"kind": "laser", "by": 9, "age": 0.2, "path": [[x + 250.0, y, z + 10.0], [x + 100.0, y, z + 7.0]]},
+            ]
+            bot.update_memory(o)
+            self.assertNotIn(my_id, bot.seen)
+            # Visible mech 7 keeps its exact obs["mechs"] position, not beam path[0]
+            self.assertEqual(bot.seen[7][1], [x + 50.0, y, z])
+            # Unseen shooter 9 injected with timestamp t - age and z - 7.0
+            self.assertIn(9, bot.seen)
+            bt, bpos, bvel = bot.seen[9]
+            self.assertAlmostEqual(bt, 39.8, places=4)
+            self.assertAlmostEqual(bpos[0], x + 250.0, places=4)
+            self.assertAlmostEqual(bpos[2], z + 3.0, places=4)
+            self.assertEqual(bvel, [0.0, 0.0, 0.0])
+
+            # Distant unseen shooter (250 m > 140 m) does not block crate farming
+            bot.seen.pop(7, None)
+            o["mechs"] = []
+            cx_c, cy_c = x + 15.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 3001, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+
+            # Closer unseen shooter (100 m <= 140 m) DOES block crate farming
+            bot.seen[9] = (o["t"] - 0.1, [x + 100.0, y, z], [0.0, 0.0, 0.0])
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_nav_fixes_hill_pickup_and_general_stall_recovery(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["nav_fixes"] = True
+        B.FLAGS["early_weapon"] = False
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 20.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            # Pickup 25m away with local ground_z != mech z (simulate mech on a different elevation by offsetting mech z by -6.0)
+            px, py = x + 25.0, y
+            pz = WORLD.ground_z(px, py)
+            o["self"]["pos"] = [x, y, pz - 6.0]
+            o["pickups"] = [{"id": 4001, "kind": "laser", "pos": [px, py, pz]}]
+            bot.choose_take(o, o["self"])
+            self.assertEqual(bot.loot_goal, (px, py))
+
+            # Roof pickup (pz = ground_z + 6.0) is rejected even with nav_fixes=True
+            o["pickups"] = [{"id": 4002, "kind": "laser", "pos": [px, py, pz + 6.0]}]
+            bot.choose_take(o, o["self"])
+            self.assertIsNone(bot.loot_goal)
+
+            # Generalized stall recovery on loot_goal (with early_weapon=False)
+            o["self"]["pos"] = [x, y, z]
+            o["pickups"] = [{"id": 4001, "kind": "laser", "pos": [px, py, pz]}]
+            bot.act(copy.deepcopy(o))
+            o2 = copy.deepcopy(o)
+            o2["t"] += 2.3
+            bot.act(o2)
+            self.assertIn(4001, bot.bad_pickups)
+            self.assertGreater(bot.unstick_until, o2["t"])
+
+            # Generalized stall recovery on settle_corner
+            bot2 = B.Bot(copy.deepcopy(HELLO))
+            o3 = make_obs(in_zone=True)
+            o3["t"] = 30.0
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o3["self"]["pos"] = [mx, my, mz]
+            o3["zone"].update(next_center=[mx + 15.0, my], next_radius=200.0)
+            o3["mechs"] = []
+            o3["cubes"] = []
+            o3["pickups"] = []
+            o3["crates"] = []
+            o3["drops"] = []
+            o3["events"] = []
+            bot2.movement(o3, o3["self"])
+            self.assertIsNotNone(bot2.settle_corner)
+            o4 = copy.deepcopy(o3)
+            o4["t"] += 2.3
+            bot2.movement(o4, o4["self"])
+            self.assertIsNone(bot2.settle_corner)
+            self.assertGreater(bot2.unstick_until, o4["t"])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_next_waypoint_cube_grown_radius_check(self):
+        # Verify cube-grown next_waypoint invokes path_clear and falls back when grown radius fails
+        start_xyz = (0.0, 0.0, 0.0)
+        path = [(5.0, 0.0), (10.0, 0.0), (15.0, 0.0)]
+        old_nlc = WORLD.nav_line_clear
+        old_pc = WORLD.path_clear
+        calls = []
+        try:
+            WORLD.nav_line_clear = lambda a, b: True
+            def fake_pc(a, b, radius=None, height=None, step=2.5):
+                calls.append((b[0], radius))
+                # Reject distant shortcut when cube-grown, allow closer point
+                return b[0] <= 10.0
+            WORLD.path_clear = fake_pc
+
+            # Base radius: skips path_clear, returns farthest point (15, 0)
+            wp_base = WORLD.next_waypoint(start_xyz, path, radius=WORLD.mech_r, height=WORLD.mech_h)
+            self.assertEqual(wp_base, (15.0, 0.0))
+            self.assertEqual(calls, [])
+
+            # Cube-grown radius (> mech_r + 0.3): checks path_clear, rejects (15, 0), returns (10, 0)
+            wp_grown = WORLD.next_waypoint(start_xyz, path, radius=WORLD.mech_r + 0.8, height=WORLD.mech_h + 1.0)
+            self.assertEqual(wp_grown, (10.0, 0.0))
+            self.assertEqual(len(calls), 2)
+        finally:
+            WORLD.nav_line_clear = old_nlc
+            WORLD.path_clear = old_pc
+
+    def test_anti_lightning_backpedal_and_boost(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["combat_micro"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, energy=60.0, hp=1400.0, max_hp=1400.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["events"] = []
+            e_light = enemy(7, (x + 35.0, y, WORLD.ground_z(x + 35.0, y)))
+            e_light["weapons"] = ["gun", "lightning"]
+            o["mechs"] = [e_light]
+            bot.choose_cover = lambda *args, **kwargs: None
+
+            # Enemy lightning mech at 35m (<44m) with energy > 30: backpedals away (-x) and boosts
+            a = bot.movement(o, o["self"])
+            self.assertLess(a["move"][0], -0.5)
+            self.assertTrue(a["boost"])
+
+            # At 48m (<=52m but >=44m): still backpedals, does NOT boost
+            e_light["pos"] = [x + 48.0, y, WORLD.ground_z(x + 48.0, y)]
+            a_far = bot.movement(o, o["self"])
+            self.assertLess(a_far["move"][0], -0.5)
+            self.assertFalse(a_far["boost"])
+
+            # If we also hold lightning: does not backpedal
+            o["self"]["weapons"] = [o["self"]["weapons"][0], {"kind": "lightning", "cooldown": 0.0,
+                                                              "stats": dict(HELLO["config"]["weapons"]["lightning"])}]
+            e_light["pos"] = [x + 35.0, y, WORLD.ground_z(x + 35.0, y)]
+            al_pt, _ = bot.choose_anti_lightning(o, o["self"], x, y, 160.0)
+            self.assertIsNone(al_pt)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_mortar_close_gate_and_laser_cookoff_early_release(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["combat_micro"] = True
+        B.FLAGS["mortar"] = True
+        B.FLAGS["laser_opt"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, cubes=0)
+            me = o["self"]
+            x, y, z = me["pos"]
+            mortar_w = {"kind": "mortar", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["mortar"])}
+            me["weapons"] = [me["weapons"][0], mortar_w]
+
+            # 1. Close-range (<32m) gun-only enemy with gun ready: mortar gated off, gun fires
+            e_close = enemy(7, (x + 25.0, y, z))
+            o["mechs"] = [e_close]
+            a_close = bot.combat(o, me)
+            me["aim"] = a_close["aim"]
+            self.assertEqual(bot.combat(o, me)["fire"], [True, False])
+
+            # Same 25m distance against lightning enemy: mortar allowed (fires slot 1 when aligned)
+            e_close["weapons"] = ["gun", "lightning"]
+            a_light = bot.combat(o, me)
+            self.assertNotAlmostEqual(a_light["aim"][1], a_close["aim"][1], places=2)
+            me["aim"] = a_light["aim"]
+            self.assertEqual(bot.combat(o, me)["fire"], [False, True])
+
+            # Low-HP enemy (<=140 HP) at 80m with gun ready: mortar gated off
+            e_low = enemy(8, (x + 80.0, y, z))
+            e_low["hp"] = 120.0
+            o["mechs"] = [e_low]
+            a_low = bot.combat(o, me)
+            me["aim"] = a_low["aim"]
+            self.assertEqual(bot.combat(o, me)["fire"], [True, False])
+
+            # 2. Laser cookoff early release against mortar enemy:
+            # charge=0.4 -> base est_dmg ~ 219; with 1.6x cookoff -> ~350 >= 300 HP -> releases early
+            laser = {"kind": "laser", "cooldown": 0.0, "charge": 0.4,
+                     "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            me["weapons"] = [None, laser]
+            me["aim"] = [0.0, 0.0]
+            e_m = enemy(9, (x + 100.0, y, z))
+            e_m["hp"] = 300.0
+            e_m["weapons"] = ["gun"]
+            o["mechs"] = [e_m]
+            self.assertTrue(bot.combat(o, me)["fire"][1])   # gun-only 300 HP: keep charging
+            e_m["weapons"] = ["gun", "mortar"]
+            self.assertFalse(bot.combat(o, me)["fire"][1])  # mortar 300 HP: cookoff early release
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_farm_ext_crate_to_3_cubes_and_lightning_zap(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["farm_crate"] = True
+        B.FLAGS["farm_ext"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1270, max_hp=1400, cubes=2, energy=80.0)
+            o["t"] = 110.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            cx_c, cy_c = x + 18.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 5001, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+
+            # At 90.7% HP and cubes=2 (t=110): farm_ext still selects crate
+            self.assertIsNotNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+
+            # At cubes=3: stops farming
+            o["self"]["cubes"] = 3
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["self"]["cubes"] = 2
+
+            # Below 90% HP (1200/1400 = 85.7%): stops farming
+            o["self"]["hp"] = 1200
+            self.assertIsNone(bot.choose_crate(o, o["self"], x, y, 160.0))
+            o["self"]["hp"] = 1270
+
+            # Lightning zaps crate when energy > 60 and aligned within cone
+            l_stats = dict(HELLO["config"]["weapons"]["lightning"])
+            o["self"]["weapons"] = [o["self"]["weapons"][0], {"kind": "lightning", "cooldown": 0.0, "stats": l_stats}]
+            bot.crate_target = o["crates"][0]
+            src = (x, y, z + o["self"]["stats"]["muzzle_height"])
+            cp = (cx_c, cy_c, cz_c + bot.crate_h * 0.5)
+            o["self"]["aim"] = bot.aim_at(src, cp, (0.0, 0.0, 0.0), None, o["self"], clamp=True)
+            ac = bot.combat(o, o["self"])
+            self.assertTrue(ac["fire"][1])
+
+            # Energy <= 60: does not zap crate
+            o["self"]["energy"] = 55.0
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_farm_ext_uncontested_drop_wider_window(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["drops"] = True
+        B.FLAGS["farm_ext"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 35.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["mechs"] = []
+            cx, cy, inner = x, y, 160.0
+
+            # Uncontested drop at 100m with lands_in=11.0s: accepted by farm_ext
+            o["drops"] = [{"id": 6001, "pos": [x + 100.0, y, z], "radius": 8.0, "lands_in": 11.0,
+                           "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            pick = bot.choose_drop(o, me, cx, cy, inner)
+            self.assertIsNotNone(pick)
+            self.assertEqual(pick[0]["id"], 6001)
+
+            # Same 100m drop when contested by 1 enemy within 35m: reverts to 85m/8s -> rejected
+            o["mechs"] = [enemy(7, (x + 110.0, y, z))]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
+
+            # Uncontested drop beyond 110m (115m): rejected
+            o["mechs"] = []
+            o["drops"][0]["pos"] = [x + 115.0, y, z]
+            self.assertIsNone(bot.choose_drop(o, me, cx, cy, inner))
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)

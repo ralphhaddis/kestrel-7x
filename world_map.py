@@ -369,14 +369,17 @@ class WorldMap:
         radius: Optional[float] = None,
         height: Optional[float] = None,
     ) -> Tuple[float, float]:
-        """String-pull along an A* path using fast nav_grid ray checks."""
+        """String-pull along an A* path using fast nav_grid ray checks (and 3D path_clear when cube-grown)."""
         if not path:
             return (start_xyz[0], start_xyz[1])
         sxy = (start_xyz[0], start_xyz[1])
         limit = min(len(path), 16)
+        grown = radius is not None and radius > self.mech_r + 0.3
         for idx in range(limit - 1, 0, -1):
-            if self.nav_line_clear(sxy, path[idx]):
-                return path[idx]
+            pt = path[idx]
+            if self.nav_line_clear(sxy, pt):
+                if not grown or self.path_clear(start_xyz, (pt[0], pt[1], start_xyz[2]), radius=radius, height=height):
+                    return pt
         return path[0]
 
     _CACHE: Dict[str, "WorldMap"] = {}
