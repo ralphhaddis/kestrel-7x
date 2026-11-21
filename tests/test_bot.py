@@ -165,6 +165,10 @@ class Decisions(unittest.TestCase):
         self.assertTrue(self.bot.combat(o, o["self"])["fire"][1])       # full, off target: hold
         o["mechs"] = [enemy(5, (x + 400, y, z))]
         self.assertTrue(self.bot.combat(o, o["self"])["fire"][1])       # full, out of range: hold charge, don't waste
+        o["mechs"] = []
+        self.assertTrue(self.bot.combat(o, o["self"])["fire"][1])       # target lost mid-charge: hold charge, don't dump
+        laser["charge"] = 0
+        self.assertFalse(self.bot.combat(o, o["self"])["fire"][1])      # not charging + no target: don't start charging
 
     def test_moves_toward_zone_when_outside(self):
         o = make_obs(in_zone=False)

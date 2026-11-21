@@ -15,7 +15,7 @@ import random
 import mechfight as mf
 
 FLAGS = {
-    "loot": False,   # detour to and take weapon pickups (kinds in LOOT_PREF)
+    "loot": True,   # detour to and take weapon pickups (kinds in LOOT_PREF)
     "fight": True,   # aim at and shoot enemies
     "lead": True,    # lead moving targets by projectile flight time (gun)
     "debug": True,   # attach debug drawings (never affects the match)
@@ -126,7 +126,7 @@ class Bot:
                 continue
             if abs(p["pos"][2] - z) > 4.0:  # take works within 4 m vertically; roofs need map awareness
                 continue
-            if math.hypot(p["pos"][0] - cx, p["pos"][1] - cy) > inner:  # don't pull back out of the next circle
+            if math.dist((x, y), p["pos"][:2]) >= self.reach - 0.25 and math.hypot(p["pos"][0] - cx, p["pos"][1] - cy) > inner:  # don't pull back out of the next circle
                 continue
             d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
             if d < best_d:
@@ -149,9 +149,26 @@ class Bot:
         goal = None
         if not me["in_zone"] or d > inner:
             goal = (cx, cy)
+        elif self.threat and t - self.threat[0] < THREAT_MEMORY_S:
+            # Strafe across the incoming fire, keeping the same side across ticks.
+            bearing = self.threat[1]
+            dx, dy = -math.sin(bearing), math.cos(bearing)
+            if self.unstick_side < 0:
+                dx, dy = -dx, -dy
+            if inner > 3:
+                goal = (x + dx, y + dy)
+            else:
+                goal = (cx, cy)
         elif self.loot_goal is not None:
             goal = self.loot_goal
-        elif d > settle:
+        elif me.get("cubes", 0) < self.cfg["cubes"]["stat_cap"]:
+            candidates = [c["pos"] for c in obs["cubes"]
+                          if abs(c["pos"][2] - me["pos"][2]) <= 4
+                          and math.dist(c["pos"][:2], (cx, cy)) <= inner
+                          and math.dist(c["pos"][:2], (x, y)) <= 20]
+            if candidates:
+                goal = min(candidates, key=lambda pos: math.dist(pos[:2], (x, y)))
+        if goal is None and d > settle:
             goal = (cx, cy)
 
         if goal is None:  # hold still: silent, and the gun is steadier
@@ -176,12 +193,18 @@ class Bot:
             self.unstick_side = -self.unstick_side
             self.stuck_s = 0.0
         if t < self.unstick_until:
-            yaw += self.unstick_side * 0.6
+            yaw += self.unstick_side * 1.1
             jump = me["grounded"]
             boost = boost or (not me["grounded"] and me["energy"] > 10)
 
+        speed = 1.0
+        if zone["next_radius"] == 0 and t >= self.unstick_until:
+            speed = min(1.0, d / 4.0)
+            if d < 4.0:
+                self.stuck_s = 0.0
+                boost = False
         self.move_yaw = yaw
-        return {"move": [math.cos(yaw), math.sin(yaw)], "boost": bool(boost), "jump": bool(jump)}
+        return {"move": [speed * math.cos(yaw), speed * math.sin(yaw)], "boost": bool(boost), "jump": bool(jump)}
 
     # ------------------------------------------------------------------ combat
     def pick_target(self, obs: mf.Observation, me):
@@ -233,6 +256,9 @@ class Bot:
         gun = next((w for w in weapons if w and w["kind"] == "gun"), None)
 
         if target is None:
+            for i, w in enumerate(weapons):
+                if w and w["kind"] == "laser" and w.get("charge", 0) > 0:
+                    fire[i] = True  # hold charge (up to hold_s) if target briefly vanished
             aim = self.idle_aim(obs, me)
             out = {"aim": aim, "fire": fire}
             if gun and gun.get("reload", 0) == 0 and gun.get("ammo", 0) < gun["stats"]["mag"] * 0.5:
