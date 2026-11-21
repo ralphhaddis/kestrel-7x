@@ -109,6 +109,105 @@ class WorldMap:
         self.nav_nx: int = max(1, int(math.ceil((self.bounds["maxX"] - self.nav_min_x) / self.nav_step)))
         self.nav_ny: int = max(1, int(math.ceil((self.bounds["maxY"] - self.nav_min_y) / self.nav_step)))
         self.nav_grid: bytearray = self._build_nav_grid()
+        self.corner_nodes: List[Tuple[float, float]] = []
+        self.corner_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        self._build_corner_nodes()
+
+    def _build_corner_nodes(self) -> None:
+        """Precompute walkable exterior building corners offset by mech_r + 1.5 m into a 16 m grid."""
+        offset = self.mech_r + 1.5
+        cell = self.cell
+        nodes = self.corner_nodes
+        cgrid = self.corner_grid
+        seen_cells = set()
+
+        for p in self.prisms:
+            if p["kind"] == "bridge":
+                continue
+            poly = p["poly"]
+            n = len(poly)
+            if n < 3:
+                continue
+            area2 = 0.0
+            px1, py1 = poly[-1]
+            for px2, py2 in poly:
+                area2 += px1 * py2 - px2 * py1
+                px1, py1 = px2, py2
+            if abs(area2) < 1e-3:
+                continue
+            ccw = 1.0 if area2 > 0.0 else -1.0
+            top = p["top"]
+
+            for i in range(n):
+                ax, ay = poly[i - 1]
+                bx, by = poly[i]
+                cx, cy = poly[(i + 1) % n]
+                dx1, dy1 = bx - ax, by - ay
+                dx2, dy2 = cx - bx, cy - by
+                l1 = math.hypot(dx1, dy1)
+                l2 = math.hypot(dx2, dy2)
+                if l1 < 1e-3 or l2 < 1e-3:
+                    continue
+                e1x, e1y = dx1 / l1, dy1 / l1
+                e2x, e2y = dx2 / l2, dy2 / l2
+                cross = (e1x * e2y - e1y * e2x) * ccw
+                if cross < 0.25:
+                    continue
+                n1x, n1y = e1y * ccw, -e1x * ccw
+                n2x, n2y = e2y * ccw, -e2x * ccw
+                bis_x, bis_y = n1x + n2x, n1y + n2y
+                bnorm = math.hypot(bis_x, bis_y)
+                if bnorm < 1e-6:
+                    continue
+                px = bx + (bis_x / bnorm) * offset
+                py = by + (bis_y / bnorm) * offset
+                dkey = (int(math.floor(px / 4.0)), int(math.floor(py / 4.0)))
+                if dkey in seen_cells:
+                    continue
+                gz = self.ground_z(px, py)
+                if top < gz + 6.0:
+                    continue
+                if not self.is_walkable(px, py, gz, _gz=gz):
+                    continue
+                seen_cells.add(dkey)
+                pt = (px, py)
+                nodes.append(pt)
+                ckey = (int(math.floor(px / cell)), int(math.floor(py / cell)))
+                bucket = cgrid.get(ckey)
+                if bucket is None:
+                    cgrid[ckey] = [pt]
+                else:
+                    bucket.append(pt)
+
+    def nearby_corners(
+        self,
+        x: float,
+        y: float,
+        max_r: float = 42.0,
+        limit: int = 20,
+    ) -> List[Tuple[float, float]]:
+        """Return up to `limit` precomputed building corner nodes within [2.0, max_r] m, sorted by distance."""
+        cell = self.cell
+        gx0 = int(math.floor((x - max_r) / cell))
+        gy0 = int(math.floor((y - max_r) / cell))
+        gx1 = int(math.floor((x + max_r) / cell))
+        gy1 = int(math.floor((y + max_r) / cell))
+        max_r2 = max_r * max_r
+        cgrid = self.corner_grid
+        found: List[Tuple[float, float, float]] = []
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                bucket = cgrid.get((gx, gy))
+                if not bucket:
+                    continue
+                for px, py in bucket:
+                    dx = px - x
+                    dy = py - y
+                    d2 = dx * dx + dy * dy
+                    if 4.0 <= d2 <= max_r2:
+                        found.append((d2, px, py))
+        found.sort(key=lambda item: item[0])
+        return [(px, py) for _, px, py in found[:limit]]
 
     def _build_nav_grid(self) -> bytearray:
         """Build a 1-byte-per-cell walkability grid (1 = walkable, 0 = blocked) at startup."""

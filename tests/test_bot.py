@@ -1387,6 +1387,232 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_corner_cover_precompute_and_query(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(cover=True, corner_cover=True)
+        try:
+            self.assertGreater(len(WORLD.corner_nodes), 50)
+            for cx, cy in WORLD.corner_nodes[:50]:
+                self.assertTrue(WORLD.is_walkable(cx, cy))
+
+            mx, my = 29.5, -74.0
+            near = WORLD.nearby_corners(mx, my, max_r=42.0, limit=20)
+            self.assertGreater(len(near), 0)
+            self.assertLessEqual(len(near), 20)
+            dists = [math.hypot(px - mx, py - my) for px, py in near]
+            self.assertEqual(dists, sorted(dists))
+            for d in dists:
+                self.assertGreaterEqual(d, 2.0 - 1e-6)
+                self.assertLessEqual(d, 42.0 + 1e-6)
+
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(next_center=[mx, my], next_radius=200.0)
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = [{"type": "damaged", "amount": 25, "weapon": "gun",
+                            "bearing": math.atan2(ey - my, ex - mx), "by": 7}]
+            bot.update_memory(o)
+            goal = bot.choose_cover(o, o["self"], mx, my, 160.0)
+            self.assertIsNotNone(goal)
+            self.assertIn(goal, near)
+            gz = WORLD.support_z(goal[0], goal[1], mz)
+            eye_h = o["self"]["stats"]["eye_height"]
+            self.assertFalse(WORLD.has_los((goal[0], goal[1], gz + eye_h), (ex, ey, ez + 8.0)))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_laser_opt_early_release_and_zone_drop(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["laser_opt"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, cubes=0)
+            x, y, z = o["self"]["pos"]
+            laser = {"kind": "laser", "cooldown": 0.0, "charge": 0.4,
+                     "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            o["self"]["weapons"] = [None, laser]
+            o["self"]["aim"] = [0.0, 0.0]
+
+            # Early release finisher: charge=0.4 -> est_dmg ~ 219 >= 180 HP -> release (fire=False)
+            e = enemy(5, (x + 100.0, y, z))
+            e["hp"] = 180.0
+            o["mechs"] = [e]
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+
+            # High HP (500 > est_dmg): keeps charging (fire=True)
+            e["hp"] = 500.0
+            self.assertTrue(bot.combat(o, o["self"])["fire"][1])
+
+            # Out of zone: drops charge (fire=False) both with target and without target
+            o["self"]["in_zone"] = False
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+            o["mechs"] = []
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+
+            # Evading or late inside zone: drops charge
+            o["self"]["in_zone"] = True
+            o["mechs"] = [e]
+            bot.evading = True
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+            bot.evading = False
+            bot.late = True
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+            bot.late = False
+
+            # Flag disabled: restores baseline hold behavior
+            B.FLAGS["laser_opt"] = False
+            e["hp"] = 180.0
+            self.assertTrue(bot.combat(o, o["self"])["fire"][1])
+            o["self"]["in_zone"] = False
+            o["mechs"] = []
+            self.assertTrue(bot.combat(o, o["self"])["fire"][1])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_rear_guard_priority_and_retreat(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["rear_guard"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            o["t"] = 20.0
+            x, y, z = o["self"]["pos"]
+            o["mechs"] = []
+            o["events"] = []
+            # Priority 3: near sounds (weapon prio 3 beats step prio 2)
+            o["sounds"] = [
+                {"kind": "step", "bearing": 0.5, "dist": "near", "age": 0.05},
+                {"kind": "gun", "bearing": -1.2, "dist": "near", "age": 0.05},
+            ]
+            bot.update_memory(o)
+            self.assertAlmostEqual(bot.rear_guard_yaw(o, o["self"]), -1.2, places=5)
+            self.assertAlmostEqual(bot.idle_aim(o, o["self"])[0], -1.2, places=5)
+
+            # Priority 2: closest seen enemy beats near sound
+            bot.seen[4] = (o["t"] - 0.5, [x, y + 60.0, z], [0.0, 0.0, 0.0])  # north = pi/2
+            bot.seen[5] = (o["t"] - 0.5, [x + 120.0, y, z], [0.0, 0.0, 0.0])  # east = 0
+            self.assertAlmostEqual(bot.rear_guard_yaw(o, o["self"]), math.pi / 2, places=4)
+
+            # Priority 1: recent damaged bearing beats seen enemy
+            bot.threat = (o["t"] - 0.2, -2.5)
+            self.assertAlmostEqual(bot.rear_guard_yaw(o, o["self"]), -2.5, places=5)
+
+            # Retreat without LOS in combat(): locks aim to rear_guard_yaw
+            mx, my = 29.5, -87.0
+            mz = WORLD.ground_z(mx, my)
+            ex, ey = -29.2, -87.0
+            ez = WORLD.ground_z(ex, ey)
+            o["self"]["pos"] = [mx, my, mz]
+            o["self"]["in_zone"] = False
+            o["mechs"] = [enemy(8, (ex, ey, ez))]
+            bot.threat = (o["t"] - 0.1, 0.75)
+            ac = bot.combat(o, o["self"])
+            self.assertEqual(ac["fire"], [False, False])
+            self.assertAlmostEqual(ac["aim"][0], 0.75, places=5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_energy_mgmt_lightning_and_boost(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["energy_mgmt"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True)
+            me = o["self"]
+            x, y, z = me["pos"]
+            l_stats = dict(HELLO["config"]["weapons"]["lightning"])
+            cost = l_stats["energy"]
+            me["weapons"] = [None, {"kind": "lightning", "cooldown": 0.0, "stats": l_stats}]
+            me["aim"] = [0.0, 0.0]
+
+            # Non-urgent target at 35m, 1000 HP, not charging: requires cost + 30 energy
+            e = enemy(6, (x + 35.0, y, z))
+            e["hp"] = 1000.0
+            o["mechs"] = [e]
+            me["energy"] = cost + 25.0
+            self.assertFalse(bot.combat(o, me)["fire"][1])
+            me["energy"] = cost + 30.0
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+
+            # Urgent zap (low HP < 180, or dist < 25m, or charging): fires at cost + 2
+            me["energy"] = cost + 2.0
+            e["hp"] = 150.0
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+            e["hp"] = 1000.0
+            e["charging"] = True
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+            e["charging"] = False
+            e["pos"] = [x + 20.0, y, z]
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+
+            # Boost energy reserve: non-urgent kite boost needs energy >= ENERGY_RESERVE + 15 (45.0)
+            B.FLAGS["kite"] = True
+            bot2 = B.Bot(copy.deepcopy(HELLO))
+            o2 = make_obs(in_zone=True, energy=40.0)
+            ox, oy, oz = o2["self"]["pos"]
+            o2["zone"].update(center=[ox, oy], radius=400.0, next_center=[ox, oy], next_radius=300.0)
+            o2["cubes"] = []
+            o2["pickups"] = []
+            o2["mechs"] = [enemy(9, (ox + 35.0, oy, oz))]
+            bot2.choose_cover = lambda *args, **kwargs: None
+            self.assertFalse(bot2.movement(o2, o2["self"])["boost"])
+            o2["self"]["energy"] = 50.0
+            self.assertTrue(bot2.movement(o2, o2["self"])["boost"])
+
+            # Urgent boost (outside zone): still boosts at low energy
+            o2["self"]["in_zone"] = False
+            o2["self"]["energy"] = 20.0
+            self.assertTrue(bot2.movement(o2, o2["self"])["boost"])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_smart_upgrades_loadout_aware(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["smart_upgrades"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs()
+            def offer(*ids):
+                o["offer"] = {"id": 1, "expires": 9, "choices": [{"id": i, "name": "", "desc": ""} for i in ids]}
+                return bot.choose_pick(o)["pick"]
+
+            # Gun only: unheld laser_charge (10) loses to servos (55) and jets (30) and unknown (20)
+            self.assertEqual(offer("laser_charge", "servos", "jets"), 1)
+            self.assertEqual(offer("laser_charge", "zzz", "mortar_reload"), 1)
+
+            # Holding laser: laser_charge (82) beats gun_rate (75), but armor (100) beats laser_charge
+            o["self"]["weapons"] = [o["self"]["weapons"][0], {"kind": "laser", "cooldown": 0, "charge": 0,
+                                                              "stats": dict(HELLO["config"]["weapons"]["laser"])}]
+            self.assertEqual(offer("gun_rate", "laser_charge", "servos"), 1)
+            self.assertEqual(offer("laser_charge", "armor", "plating"), 1)
+
+            # Holding mortar: mortar_reload (78) beats gun_rate (75) and unheld lightning_range (10)
+            o["self"]["weapons"] = [o["self"]["weapons"][0], {"kind": "mortar", "cooldown": 0,
+                                                              "stats": dict(HELLO["config"]["weapons"]["mortar"])}]
+            self.assertEqual(offer("lightning_range", "gun_rate", "mortar_reload"), 2)
+
+            # Holding lightning: lightning_range (78) beats gun_rate (75)
+            o["self"]["weapons"] = [o["self"]["weapons"][0], {"kind": "lightning", "cooldown": 0,
+                                                              "stats": dict(HELLO["config"]["weapons"]["lightning"])}]
+            self.assertEqual(offer("gun_rate", "lightning_range", "servos"), 1)
+
+            # Flag disabled: falls back to UPGRADE_PREF (gun_rate beats lightning_range)
+            B.FLAGS["smart_upgrades"] = False
+            self.assertEqual(offer("lightning_range", "gun_rate", "servos"), 1)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()
