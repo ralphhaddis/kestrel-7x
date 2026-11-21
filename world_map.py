@@ -289,6 +289,8 @@ class WorldMap:
                     floor_z = top
         return floor_z
 
+    _support_z = support_z
+
     def path_clear(
         self,
         a: Tuple[float, float, float],
