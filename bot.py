@@ -29,8 +29,10 @@ FLAGS = {
     "cover": True,            # seek cover when inside the zone and threatened
     "los_gate": True,         # gate fire[i] on world.has_los(src, tp)
     "cubes": True,            # 20 m cube-seeking
-    "early_weapon": True,     # H1: path-verified 85 m unpressured local-floor pickup detour (official server A/B vs 2.94)
+    "astar_nav": True,        # Precomputed 5 m A* routing around buildings when direct path_clear fails
+    "evade": True,            # dodge incoming mortar impacts and charging-laser aim rays
     # Keep the flags below False (verified in 48-match 1-copy bot:Bot=1 ablations against e39d414 = 9.25):
+    "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
     "safe_laser": False,      # gate laser charge on LOS, no cover_goal, hp>140 (-0.23 pts in 1-copy sim: 9.02 vs 9.25)
     "heal": False,            # HEAL_COVER ceasefire (-0.44 pts in 1-copy sim)
     "kite": False,            # open-field kite / 0.60 settle (-1.94 pts; overrides loot_goal)
@@ -79,6 +81,10 @@ class Bot:
         self.npc_h = cfg["npc"]["height"]
         self.npc_r = cfg["npc"]["radius"]
         self.reach = cfg["loot"]["pickup_radius"]
+        mcfg = cfg.get("weapons", {}).get("mortar", {})
+        self.mortar_g = float(mcfg.get("gravity", 22.0))
+        self.mortar_splash = float(mcfg.get("splash_radius", 7.0))
+        self.laser_range = float(cfg.get("weapons", {}).get("laser", {}).get("range", 280.0))
 
         self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
@@ -107,6 +113,11 @@ class Bot:
         self.unstick_until = -1.0
         self.unstick_side = 1
         self.strafe_flip_t = 0.0
+        self.nav_path: Optional[List[Tuple[float, float]]] = None
+        self.nav_goal: Optional[Tuple[float, float]] = None
+        self.nav_until = -1.0
+        self.evading = False
+        self.evade_impacts: List[Tuple[float, float, float]] = []
         mf.log(f"{self.name}: slot {hello['slot']} seed {hello['seed']}")
 
     # ------------------------------------------------------------------ main step
@@ -497,6 +508,176 @@ class Bot:
             return (x + dx, y + dy), dodge_boost
         return None, False
 
+    def choose_evade(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Tuple[Optional[Tuple[float, float]], bool]:
+        """Predict incoming mortar impacts and charging-laser aim rays; return (dodge_goal, should_boost)."""
+        self.evade_impacts = []
+        if not FLAGS.get("evade", True):
+            return None, False
+
+        mortars = [p for p in obs.get("projectiles", ()) if p.get("kind") == "mortar"]
+        chargers = [m for m in obs.get("mechs", ()) if m.get("kind") == "mech" and m.get("charging")]
+        if not mortars and not chargers:
+            return None, False
+
+        x, y, z = me["pos"]
+        st = me["stats"]
+        mr = st.get("radius", self.mech_r)
+        mh = st.get("height", self.mech_h)
+        eye_h = st.get("eye_height", 8.0)
+        me_center = (x, y, z + mh * 0.5)
+
+        # A. Predict mortar threats: (ix, iy, iz, t_imp, danger_r)
+        mortar_threats: List[Tuple[float, float, float, float, float]] = []
+        danger_r = self.mortar_splash * 1.3 + mr + 1.5
+        g = max(1.0, self.mortar_g)
+        for p in mortars:
+            px, py, pz = p["pos"]
+            vx, vy, vz = p["vel"]
+            zf = z
+            disc = vz * vz + 2.0 * g * (pz - zf)
+            if disc < 0.0:
+                continue
+            t_imp = (vz + math.sqrt(disc)) / g
+            if t_imp <= 0.0 or t_imp > 3.8:
+                continue
+            ix, iy = px + vx * t_imp, py + vy * t_imp
+            if self.world is not None:
+                zf = self.world.support_z(ix, iy, z)
+                disc2 = vz * vz + 2.0 * g * (pz - zf)
+                if disc2 >= 0.0:
+                    t_imp = (vz + math.sqrt(disc2)) / g
+                    if t_imp <= 0.0 or t_imp > 3.8:
+                        continue
+                    ix, iy = px + vx * t_imp, py + vy * t_imp
+
+            in_splash = math.hypot(ix - x, iy - y) < danger_r
+            direct_hit = False
+            v2 = vx * vx + vy * vy
+            if v2 > 1e-3:
+                tc = max(0.0, min(t_imp, ((x - px) * vx + (y - py) * vy) / v2))
+                cx_m = px + vx * tc
+                cy_m = py + vy * tc
+                cz_m = pz + vz * tc - 0.5 * g * tc * tc
+                if math.hypot(cx_m - x, cy_m - y) < mr + 2.0 and (z - 1.0) <= cz_m <= (z + mh + 1.5):
+                    direct_hit = True
+                    ix, iy, zf, t_imp = cx_m, cy_m, z, tc
+
+            if in_splash or direct_hit:
+                if not direct_hit and self.world is not None and not self.world.has_los((ix, iy, zf + 0.5), me_center):
+                    continue
+                mortar_threats.append((ix, iy, zf, t_imp, danger_r))
+                self.evade_impacts.append((ix, iy, zf))
+
+        # B. Detect charging-laser threats: (ex, ey, emz, dx, dy, left_x, left_y, perp_dist)
+        laser_threats: List[Tuple[float, float, float, float, float, float, float, float]] = []
+        base_muzzle_h = self.cfg["mech"].get("muzzle_height", 7.0)
+        for m in chargers:
+            ep = m["pos"]
+            aim = m.get("aim")
+            if not aim:
+                continue
+            eyaw, epitch = aim[0], aim[1]
+            ek = 1.0 + self.size_per_cube * m.get("cubes", 0)
+            emz = ep[2] + base_muzzle_h * ek
+            cp = math.cos(epitch)
+            ux, uy, uz = cp * math.cos(eyaw), cp * math.sin(eyaw), math.sin(epitch)
+            rx, ry, rz = x - ep[0], y - ep[1], (z + mh * 0.5) - emz
+            s = rx * ux + ry * uy + rz * uz
+            if s <= 0.0 or s > self.laser_range:
+                continue
+            cx_r, cy_r, cz_r = ep[0] + s * ux, ep[1] + s * uy, emz + s * uz
+            perp_xy = math.hypot(x - cx_r, y - cy_r)
+            if perp_xy > mr + 5.5 or abs((z + mh * 0.5) - cz_r) > mh * 0.5 + 4.5:
+                continue
+            if self.world is not None and not self.world.has_los((ep[0], ep[1], emz), me_center):
+                continue
+            dx, dy = math.cos(eyaw), math.sin(eyaw)
+            left_x, left_y = -dy, dx
+            laser_threats.append((ep[0], ep[1], emz, dx, dy, left_x, left_y, perp_xy))
+
+        if not mortar_threats and not laser_threats:
+            return None, False
+
+        # C. Sample & score dodge candidates
+        angles: List[float] = []
+        for ix, iy, _, _, _ in mortar_threats:
+            if math.hypot(x - ix, y - iy) < 0.5:
+                angles.append(math.atan2(cy - y, cx - x))
+            else:
+                angles.append(math.atan2(y - iy, x - ix))
+        for ex, ey, _, _, _, left_x, left_y, _ in laser_threats:
+            left_dot = (x - ex) * left_x + (y - ey) * left_y
+            side = 1.0 if left_dot >= 0.0 else -1.0
+            angles.append(math.atan2(side * left_y, side * left_x))
+            angles.append(math.atan2(-side * left_y, -side * left_x))
+        for k in range(8):
+            angles.append(TAU * k / 8.0)
+
+        step_r = 12.0
+        zcx, zcy = obs["zone"]["center"]
+        zrad = obs["zone"]["radius"]
+        cur_zd = math.hypot(x - zcx, y - zcy)
+        cur_dc = math.hypot(x - cx, y - cy)
+        mv_x = math.cos(self.move_yaw) if self.move_yaw is not None else 0.0
+        mv_y = math.sin(self.move_yaw) if self.move_yaw is not None else 0.0
+        best_pt: Optional[Tuple[float, float]] = None
+        best_score = -math.inf
+
+        for ang in angles:
+            ca, sa = math.cos(ang), math.sin(ang)
+            kx, ky = x + step_r * ca, y + step_r * sa
+            cand_zd = math.hypot(kx - zcx, ky - zcy)
+            if me["in_zone"]:
+                if zrad > 6.0 and cand_zd > zrad - 3.0:
+                    continue
+                if self.late and math.hypot(kx - cx, ky - cy) > cur_dc + 2.0:
+                    continue
+            else:
+                if cand_zd >= cur_zd:
+                    continue
+
+            if self.world is not None:
+                kz = self.world.support_z(kx, ky, z)
+                if not (self.world.is_walkable(kx, ky, kz, radius=mr, height=mh)
+                        and self.world.path_clear(me["pos"], (kx, ky, kz), radius=mr, height=mh)):
+                    continue
+            else:
+                kz = z
+
+            score = 0.0
+            for ix, iy, _, _, dr in mortar_threats:
+                md = math.hypot(kx - ix, ky - iy)
+                if md >= dr:
+                    score += 120.0 + min(md - dr, 10.0)
+                else:
+                    score += md * 6.0
+            for ex, ey, emz, _, _, left_x, left_y, _ in laser_threats:
+                cur_dot = (x - ex) * left_x + (y - ey) * left_y
+                cand_dot = (kx - ex) * left_x + (ky - ey) * left_y
+                score += min(abs(cand_dot), 18.0) * 8.0
+                if (cur_dot > 0.5 and cand_dot < 0.0) or (cur_dot < -0.5 and cand_dot > 0.0):
+                    score -= 60.0
+                if self.world is not None and not self.world.has_los((ex, ey, emz), (kx, ky, kz + eye_h)):
+                    score += 90.0
+            d_center = math.hypot(kx - cx, ky - cy)
+            if inner > 3.0 and d_center > inner:
+                score -= 15.0
+            score -= d_center * 0.05
+            if self.move_yaw is not None:
+                score += 4.0 * (ca * mv_x + sa * mv_y)
+
+            if score > best_score:
+                best_score = score
+                best_pt = (kx, ky)
+
+        if best_pt is None:
+            return None, False
+
+        imminent_mortar = any(t_imp <= 1.8 for _, _, _, t_imp, _ in mortar_threats)
+        tight_laser = any(pd <= mr + 3.5 for *_, pd in laser_threats)
+        should_boost = bool(me.get("grounded", True)) and (me["energy"] > 15.0) and (imminent_mortar or tight_laser)
+        return best_pt, should_boost
+
     def movement(self, obs: mf.Observation, me) -> dict:
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
@@ -514,9 +695,15 @@ class Bot:
 
         late_r = max(inner, 4.0) if zone["next_radius"] == 0 else inner
         self.late = d > late_r and (d - late_r) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
+        self.evading = False
         kite_boost = False
         goal = None
-        if not me["in_zone"] or d > inner:
+        evade_goal, evade_boost = self.choose_evade(obs, me, cx, cy, inner)
+        if evade_goal is not None:
+            self.evading = True
+            goal = evade_goal
+            kite_boost = evade_boost
+        elif not me["in_zone"] or d > inner:
             self.cover_goal = None
             goal = (cx, cy)
         else:
@@ -579,6 +766,8 @@ class Bot:
             self.stuck_s = 0.0
             self.unstick_until = -1.0
             self.progress_anchor = None
+            self.nav_path = None
+            self.nav_goal = None
             return {"move": [0.0, 0.0], "boost": False, "jump": False}
 
         if FLAGS.get("early_weapon", False) and self.loot_goal is not None and goal == self.loot_goal:
@@ -595,7 +784,28 @@ class Bot:
         else:
             self.progress_anchor = None
 
-        yaw = math.atan2(goal[1] - y, goal[0] - x)
+        steer_target = goal
+        if (FLAGS.get("astar_nav", False) and self.world is not None
+                and not self.evading
+                and t >= self.unstick_until
+                and math.hypot(goal[0] - x, goal[1] - y) > 10.0):
+            if self.world.nav_line_clear((x, y), goal):
+                self.nav_path = None
+                self.nav_goal = None
+            else:
+                replan = (self.nav_goal is None
+                          or t >= self.nav_until
+                          or math.hypot(goal[0] - self.nav_goal[0], goal[1] - self.nav_goal[1]) > 12.0)
+                if replan:
+                    self.nav_path = self.world.find_path((x, y), goal, max_expansions=800)
+                    self.nav_goal = goal
+                    self.nav_until = t + 1.5
+                if self.nav_path:
+                    while len(self.nav_path) > 1 and math.hypot(self.nav_path[0][0] - x, self.nav_path[0][1] - y) < 6.0:
+                        self.nav_path.pop(0)
+                    steer_target = self.world.next_waypoint(me["pos"], self.nav_path)
+
+        yaw = math.atan2(steer_target[1] - y, steer_target[0] - x)
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.
         boost = not me["in_zone"] or self.late or kite_boost
         jump = False
@@ -615,7 +825,7 @@ class Bot:
             boost = boost or (not me["grounded"] and me["energy"] > 10)
 
         speed = 1.0
-        if zone["next_radius"] == 0 and t >= self.unstick_until:
+        if zone["next_radius"] == 0 and t >= self.unstick_until and not self.evading:
             speed = min(1.0, d / 4.0)
             if d < 4.0:
                 self.stuck_s = 0.0
@@ -711,11 +921,11 @@ class Bot:
                           and dist <= laser["stats"]["range"] and me["in_zone"]
                           and has_los and self.cover_goal is None
                           and target.get("hp", 1400.0) > 140.0
-                          and not self.late and not self.healing)
+                          and not self.late and not self.healing and not self.evading)
         else:
             can_charge = (laser is not None and laser["cooldown"] <= 0
                           and dist <= laser["stats"]["range"] and me["in_zone"]
-                          and not self.late and not self.healing)
+                          and not self.late and not self.healing and not self.evading)
         laser_primary = laser is not None and dist <= laser["stats"]["range"] and (
             laser.get("charge", 0) > 0 or can_charge)
         yaw, pitch = direct if laser_primary or gun is None else led
@@ -789,6 +999,8 @@ class Bot:
             mf.draw.line([x, y, z + me["stats"]["muzzle_height"]], list(tp), "#ff5040")
         if self.cover_goal is not None:
             mf.draw.point([self.cover_goal[0], self.cover_goal[1], z], "#40ff80", 6)
+        for ix, iy, iz in self.evade_impacts:
+            mf.draw.point([ix, iy, iz], "#ffaa00", 5)
         mf.draw.label(f"{state} | hp {me['hp']:.0f} e {me['energy']:.0f}"[:80])
 
 

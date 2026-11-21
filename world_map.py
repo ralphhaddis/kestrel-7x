@@ -8,6 +8,7 @@ spatial hash grid for sub-millisecond ``ground_z``, ``is_walkable``, ``path_clea
 from __future__ import annotations
 
 import array
+import heapq
 import json
 import math
 import os
@@ -51,6 +52,7 @@ class WorldMap:
         self.heights.frombytes(raw)
         if sys.byteorder != "little":
             self.heights.byteswap()
+        self.max_ground_z: float = (max(self.heights) * self.scale) if self.heights else 0.0
 
         cfg = mech_cfg or {}
         self.mech_r: float = float(cfg.get("radius", 2.5))
@@ -100,6 +102,184 @@ class WorldMap:
                     else:
                         bucket.append(p_dict)
 
+        # Precompute coarse 5.0 m 2D walkability grid for fast A* routing around campus buildings
+        self.nav_step: float = 5.0
+        self.nav_min_x: float = self.bounds["minX"]
+        self.nav_min_y: float = self.bounds["minY"]
+        self.nav_nx: int = max(1, int(math.ceil((self.bounds["maxX"] - self.nav_min_x) / self.nav_step)))
+        self.nav_ny: int = max(1, int(math.ceil((self.bounds["maxY"] - self.nav_min_y) / self.nav_step)))
+        self.nav_grid: bytearray = self._build_nav_grid()
+
+    def _build_nav_grid(self) -> bytearray:
+        """Build a 1-byte-per-cell walkability grid (1 = walkable, 0 = blocked) at startup."""
+        nx = self.nav_nx
+        ny = self.nav_ny
+        step = self.nav_step
+        x0 = self.nav_min_x + 0.5 * step
+        y0 = self.nav_min_y + 0.5 * step
+        nav = bytearray(nx * ny)
+        is_walk = self.is_walkable
+        for j in range(ny):
+            wy = y0 + j * step
+            row = j * nx
+            for i in range(nx):
+                if is_walk(x0 + i * step, wy):
+                    nav[row + i] = 1
+        return nav
+
+    def _world_to_nav(self, x: float, y: float) -> Tuple[int, int]:
+        i = int((x - self.nav_min_x) / self.nav_step)
+        j = int((y - self.nav_min_y) / self.nav_step)
+        if i < 0:
+            i = 0
+        elif i >= self.nav_nx:
+            i = self.nav_nx - 1
+        if j < 0:
+            j = 0
+        elif j >= self.nav_ny:
+            j = self.nav_ny - 1
+        return i, j
+
+    def _nav_to_world(self, i: int, j: int) -> Tuple[float, float]:
+        return (self.nav_min_x + (i + 0.5) * self.nav_step, self.nav_min_y + (j + 0.5) * self.nav_step)
+
+    def _nearest_walkable_cell(self, ci: int, cj: int, max_r: int = 8) -> Optional[Tuple[int, int]]:
+        nx, ny, nav = self.nav_nx, self.nav_ny, self.nav_grid
+        if nav[cj * nx + ci]:
+            return ci, cj
+        for r in range(1, max_r + 1):
+            best = None
+            best_d2 = 10**9
+            for di in range(-r, r + 1):
+                for dj in (-r, r) if abs(di) < r else range(-r, r + 1):
+                    ni, nj = ci + di, cj + dj
+                    if 0 <= ni < nx and 0 <= nj < ny and nav[nj * nx + ni]:
+                        d2 = di * di + dj * dj
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = (ni, nj)
+            if best is not None:
+                return best
+        return None
+
+    def find_path(
+        self,
+        start_xy: Tuple[float, float],
+        goal_xy: Tuple[float, float],
+        max_expansions: int = 2000,
+    ) -> Optional[List[Tuple[float, float]]]:
+        """8-connected A* on the precomputed 5.0 m nav grid; returns world waypoints or None."""
+        si, sj = self._world_to_nav(start_xy[0], start_xy[1])
+        gi, gj = self._world_to_nav(goal_xy[0], goal_xy[1])
+        start = self._nearest_walkable_cell(si, sj, max_r=6)
+        goal = self._nearest_walkable_cell(gi, gj, max_r=10)
+        if start is None or goal is None:
+            return None
+        if start == goal:
+            return [goal_xy]
+
+        nx, ny, nav = self.nav_nx, self.nav_ny, self.nav_grid
+        si, sj = start
+        gi, gj = goal
+        s_idx = sj * nx + si
+        g_idx = gj * nx + gi
+
+        # Octile heuristic * 10 (integer costs: 10 orthogonal, 14 diagonal)
+        dx0 = abs(gi - si)
+        dy0 = abs(gj - sj)
+        h0 = 10 * (dx0 + dy0) - 6 * (dx0 if dx0 < dy0 else dy0)
+
+        g_score: Dict[int, int] = {s_idx: 0}
+        came_from: Dict[int, int] = {}
+        heap: List[Tuple[int, int, int]] = [(h0, 0, s_idx)]
+        closed = set()
+        expansions = 0
+
+        neighbors = (
+            (1, 0, 10), (-1, 0, 10), (0, 1, 10), (0, -1, 10),
+            (1, 1, 14), (1, -1, 14), (-1, 1, 14), (-1, -1, 14),
+        )
+        while heap and expansions < max_expansions:
+            _, cur_g, cur = heapq.heappop(heap)
+            if cur in closed:
+                continue
+            if cur == g_idx:
+                path_cells: List[Tuple[int, int]] = []
+                node = cur
+                while node != s_idx:
+                    path_cells.append((node % nx, node // nx))
+                    node = came_from[node]
+                path_cells.reverse()
+                pts = [self._nav_to_world(ci, cj) for ci, cj in path_cells]
+                if nav[gj * nx + gi]:
+                    pts[-1] = goal_xy if self.is_walkable(goal_xy[0], goal_xy[1]) else pts[-1]
+                return pts
+            closed.add(cur)
+            expansions += 1
+            ci = cur % nx
+            cj = cur // nx
+            for di, dj, step_cost in neighbors:
+                ni = ci + di
+                nj = cj + dj
+                if ni < 0 or ni >= nx or nj < 0 or nj >= ny:
+                    continue
+                n_idx = nj * nx + ni
+                if not nav[n_idx] or n_idx in closed:
+                    continue
+                # Prevent diagonal corner-cutting through building corners
+                if di != 0 and dj != 0:
+                    if not (nav[cj * nx + ni] and nav[nj * nx + ci]):
+                        continue
+                ng = cur_g + step_cost
+                old_g = g_score.get(n_idx)
+                if old_g is None or ng < old_g:
+                    g_score[n_idx] = ng
+                    came_from[n_idx] = cur
+                    adx = abs(gi - ni)
+                    ady = abs(gj - nj)
+                    h = 10 * (adx + ady) - 6 * (adx if adx < ady else ady)
+                    # Weighted A* (1.5x heuristic) finds near-optimal paths in ~10x fewer expansions
+                    heapq.heappush(heap, (ng + (h * 3) // 2, ng, n_idx))
+        return None
+
+    def nav_line_clear(self, a_xy: Tuple[float, float], b_xy: Tuple[float, float]) -> bool:
+        """Fast O(steps) line-of-travel check directly on the precomputed 5.0 m nav_grid."""
+        ax, ay = float(a_xy[0]), float(a_xy[1])
+        bx, by = float(b_xy[0]), float(b_xy[1])
+        dx = bx - ax
+        dy = by - ay
+        dist = math.hypot(dx, dy)
+        if dist <= 1e-3:
+            return True
+        steps = max(1, int(math.ceil(dist / (self.nav_step * 0.6))))
+        inv = 1.0 / steps
+        nx, ny, nav = self.nav_nx, self.nav_ny, self.nav_grid
+        min_x, min_y, inv_step = self.nav_min_x, self.nav_min_y, 1.0 / self.nav_step
+        for k in range(1, steps + 1):
+            t = k * inv
+            i = int((ax + dx * t - min_x) * inv_step)
+            j = int((ay + dy * t - min_y) * inv_step)
+            if i < 0 or i >= nx or j < 0 or j >= ny or not nav[j * nx + i]:
+                return False
+        return True
+
+    def next_waypoint(
+        self,
+        start_xyz: Tuple[float, float, float],
+        path: List[Tuple[float, float]],
+        radius: Optional[float] = None,
+        height: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """String-pull along an A* path using fast nav_grid ray checks."""
+        if not path:
+            return (start_xyz[0], start_xyz[1])
+        sxy = (start_xyz[0], start_xyz[1])
+        limit = min(len(path), 16)
+        for idx in range(limit - 1, 0, -1):
+            if self.nav_line_clear(sxy, path[idx]):
+                return path[idx]
+        return path[0]
+
     _CACHE: Dict[str, "WorldMap"] = {}
 
     @classmethod
@@ -107,8 +287,12 @@ class WorldMap:
         """Load WorldMap from a hello message, returning None cleanly if map files are missing."""
         try:
             map_dir = str(hello.get("map", {}).get("dir", "/arena"))
-            mech_cfg = hello.get("config", {}).get("mech")
-            key = f"{map_dir}:{ (mech_cfg or {}).get('radius', 2.5) }:{ (mech_cfg or {}).get('height', 9.0) }"
+            mech_cfg = hello.get("config", {}).get("mech") or {}
+            key = (
+                f"{map_dir}:{mech_cfg.get('radius', 2.5)}:{mech_cfg.get('height', 9.0)}"
+                f":{mech_cfg.get('step_up', 1.2)}:{mech_cfg.get('max_slope_deg', 50.0)}"
+                f":{mech_cfg.get('eye_height', 8.0)}"
+            )
             cached = cls._CACHE.get(key)
             if cached is not None:
                 return cached
@@ -206,18 +390,7 @@ class WorldMap:
         b0, b1, b2, b3 = p["bbox"]
         if x + r < b0 or x - r > b2 or y + r < b1 or y - r > b3:
             return False
-        if (
-            self._in_prism_xy(x, y, p)
-            or (
-                r > 0.0
-                and (
-                    self._in_prism_xy(x + r, y, p)
-                    or self._in_prism_xy(x - r, y, p)
-                    or self._in_prism_xy(x, y + r, p)
-                    or self._in_prism_xy(x, y - r, p)
-                )
-            )
-        ):
+        if self._in_prism_xy(x, y, p):
             return True
         if r <= 0.0:
             return False
@@ -235,6 +408,7 @@ class WorldMap:
         z: Optional[float] = None,
         radius: Optional[float] = None,
         height: Optional[float] = None,
+        _gz: Optional[float] = None,
     ) -> bool:
         """Return True if a cylinder of (radius, height) with feet at (x, y, z) is unobstructed and on walkable slope."""
         r = self.mech_r if radius is None else float(radius)
@@ -243,7 +417,7 @@ class WorldMap:
         if x < b["minX"] + r or x > b["maxX"] - r or y < b["minY"] + r or y > b["maxY"] - r:
             return False
 
-        gz = self.ground_z(x, y)
+        gz = self.ground_z(x, y) if _gz is None else _gz
         fz = gz if z is None else float(z)
 
         if abs(fz - gz) <= self.step_up and self.ground_slope_tan(x, y) > self.max_slope_tan:
@@ -258,8 +432,18 @@ class WorldMap:
         gx1 = int(math.floor((x + r) / cell))
         gy1 = int(math.floor((y + r) / cell))
 
-        seen_ids = set()
         grid = self.grid
+        if gx0 == gx1 and gy0 == gy1:
+            bucket = grid.get((gx0, gy0))
+            if bucket:
+                for p in bucket:
+                    if z_low >= p["top"] or z_high <= p["base"]:
+                        continue
+                    if self._circle_hits_prism_xy(x, y, r, r_sq, p):
+                        return False
+            return True
+
+        seen_ids = set()
         for gx in range(gx0, gx1 + 1):
             for gy in range(gy0, gy1 + 1):
                 bucket = grid.get((gx, gy))
@@ -277,9 +461,9 @@ class WorldMap:
                         return False
         return True
 
-    def support_z(self, x: float, y: float, cur_z: float) -> float:
-        """Compute floor height under (x, y) considering terrain and any flat prism tops <= cur_z + step_up."""
-        floor_z = self.ground_z(x, y)
+    def _support_and_ground(self, x: float, y: float, cur_z: float) -> Tuple[float, float]:
+        gz = self.ground_z(x, y)
+        floor_z = gz
         z_reach = cur_z + self.step_up
         bucket = self.grid.get((int(math.floor(x / self.cell)), int(math.floor(y / self.cell))))
         if bucket:
@@ -287,7 +471,11 @@ class WorldMap:
                 top = p["top"]
                 if floor_z < top <= z_reach and self._in_prism_xy(x, y, p):
                     floor_z = top
-        return floor_z
+        return floor_z, gz
+
+    def support_z(self, x: float, y: float, cur_z: float) -> float:
+        """Compute floor height under (x, y) considering terrain and any flat prism tops <= cur_z + step_up."""
+        return self._support_and_ground(x, y, cur_z)[0]
 
     _support_z = support_z
 
@@ -314,8 +502,8 @@ class WorldMap:
             t = k * inv
             px = ax + dx * t
             py = ay + dy * t
-            cur_z = self.support_z(px, py, cur_z)
-            if not self.is_walkable(px, py, cur_z, radius=radius, height=height):
+            cur_z, gz = self._support_and_ground(px, py, cur_z)
+            if not self.is_walkable(px, py, cur_z, radius=radius, height=height, _gz=gz):
                 return False
         return True
 
@@ -344,16 +532,22 @@ class WorldMap:
 
         cell = self.cell
         grid = self.grid
+        max_gz = self.max_ground_z
         x, y, z = ax, ay, az
+        last_cell: Optional[Tuple[int, int]] = None
+        bucket = None
         for _ in range(1, steps):
             x += sx
             y += sy
             z += sz
-            bucket = grid.get((int(x // cell), int(y // cell)))
+            c_key = (int(x // cell), int(y // cell))
+            if c_key != last_cell:
+                last_cell = c_key
+                bucket = grid.get(c_key)
             if bucket:
                 for p in bucket:
                     if p["base"] <= z <= p["top"] and self._in_prism_xy(x, y, p):
                         return False
-            if z < self.ground_z(x, y):
+            if z <= max_gz and z < self.ground_z(x, y):
                 return False
         return True

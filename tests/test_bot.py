@@ -120,6 +120,18 @@ class WorldMapTests(unittest.TestCase):
         mid_z = (-5.64 + 24.27) / 2.0
         self.assertFalse(WORLD.has_los((-50.0, -292.5, mid_z), (-25.0, -292.5, mid_z)))
 
+    def test_astar_find_path_routes_around_building(self):
+        # Start east and goal west of building prism 64 (-9.2..21.5 x -96..-78)
+        start = (29.5, -87.0)
+        goal = (-29.2, -87.0)
+        self.assertFalse(WORLD.nav_line_clear(start, goal))
+        path = WORLD.find_path(start, goal)
+        self.assertIsNotNone(path)
+        self.assertGreater(len(path), 2)
+        for wx, wy in path[:-1]:
+            self.assertTrue(WORLD.is_walkable(wx, wy), f"waypoint ({wx}, {wy}) not walkable")
+        self.assertLess(math.hypot(path[-1][0] - goal[0], path[-1][1] - goal[1]), 6.0)
+
 
 class Geometry(unittest.TestCase):
     def setUp(self):
@@ -231,7 +243,8 @@ class Decisions(unittest.TestCase):
         cx, cy = o["zone"]["next_center"]
         x, y, _ = o["self"]["pos"]
         want = math.atan2(cy - y, cx - x)
-        self.assertAlmostEqual(math.atan2(a["move"][1], a["move"][0]), want)
+        got = math.atan2(a["move"][1], a["move"][0])
+        self.assertLess(abs(B.wrap(got - want)), 0.5)
         self.assertTrue(a["boost"])
 
     def test_holds_still_at_center(self):
@@ -647,6 +660,152 @@ class Decisions(unittest.TestCase):
             self.assertFalse(bot.combat(o, o["self"])["fire"][1])
             o["mechs"][0]["hp"] = 100.0
             self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_evade_incoming_mortar_and_ignore_distant(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["evade"] = True
+        try:
+            o = make_obs(in_zone=True, energy=80.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+
+            # Incoming mortar shell landing near (x, y) in ~1.4 s under g=22
+            o["projectiles"] = [
+                {"id": 501, "kind": "mortar", "pos": [x - 60.0, y, z + 15.0], "vel": [60.0, 0.0, 5.0]}
+            ]
+            a = self.bot.movement(o, o["self"])
+            self.assertGreater(math.hypot(*a["move"]), 0.5)
+            self.assertTrue(a["boost"])
+            self.assertTrue(self.bot.evading)
+
+            # Harmless distant mortar shell landing ~40 m away: hold still
+            o["projectiles"] = [
+                {"id": 502, "kind": "mortar", "pos": [x - 100.0, y + 40.0, z + 15.0], "vel": [60.0, 0.0, 5.0]}
+            ]
+            a2 = self.bot.movement(o, o["self"])
+            self.assertEqual(a2["move"], [0.0, 0.0])
+            self.assertFalse(self.bot.evading)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_evade_charging_laser_away_from_centerline(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["evade"] = True
+        try:
+            o = make_obs(in_zone=True, energy=80.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["projectiles"] = []
+            o["events"] = []
+
+            # Enemy 100 m west aiming east; our mech is 2 m NORTH of the beam centerline
+            e = enemy(7, (x - 100.0, y - 2.0, z))
+            e["aim"] = [0.0, 0.0]
+            e["charging"] = True
+            e["weapons"] = ["gun", "laser"]
+            o["mechs"] = [e]
+            a = self.bot.movement(o, o["self"])
+            self.assertGreater(a["move"][1], 0.5)
+            self.assertTrue(a["boost"])
+            self.assertTrue(self.bot.evading)
+
+            # Not charging: no laser evasion
+            e["charging"] = False
+            self.bot.movement(o, o["self"])
+            self.assertFalse(self.bot.evading)
+
+            # Charging but aimed 45 deg away from us: no laser evasion
+            e["charging"] = True
+            e["aim"] = [0.8, 0.0]
+            self.bot.movement(o, o["self"])
+            self.assertFalse(self.bot.evading)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_evade_wall_blocked_flips_direction(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["evade"] = True
+        try:
+            o = make_obs(in_zone=True, energy=80.0)
+            mx, my = 5.0, -74.0
+            gz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, gz]
+            o["zone"].update(center=[mx, my], radius=400.0, next_center=[mx, my], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["projectiles"] = []
+            o["events"] = []
+
+            # Enemy 34 m west aiming east with clear LOS; preferred offset is slightly south into building prism 64
+            ex, ey = -29.2, -73.0
+            ez = WORLD.ground_z(ex, ey)
+            e = enemy(8, (ex, ey, ez))
+            e["aim"] = [0.0, 0.0]
+            e["charging"] = True
+            e["weapons"] = ["gun", "laser"]
+            o["mechs"] = [e]
+            a = self.bot.movement(o, o["self"])
+            self.assertTrue(self.bot.evading)
+            self.assertGreater(a["move"][1], 0.3)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_evade_zero_gun_dps_cost(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["evade"] = True
+        try:
+            o = make_obs(in_zone=True, energy=80.0, hp=1400, max_hp=1400)
+            o["t"] = 10.0
+            x, y, z = o["self"]["pos"]
+            o["self"]["aim"] = [0.0, 0.0]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["projectiles"] = []
+            o["events"] = []
+
+            e = enemy(9, (x + 50.0, y, z))
+            e["aim"] = [math.pi, 0.0]
+            e["charging"] = True
+            e["weapons"] = ["gun", "laser"]
+            o["mechs"] = [e]
+            a = self.bot.act(o)
+            self.assertTrue(self.bot.evading)
+            self.assertGreater(math.hypot(*a["move"]), 0.5)
+            self.assertTrue(a["fire"][0])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_evade_disabled_flag(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["evade"] = False
+        try:
+            o = make_obs(in_zone=True, energy=80.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            o["projectiles"] = [
+                {"id": 503, "kind": "mortar", "pos": [x - 60.0, y, z + 15.0], "vel": [60.0, 0.0, 5.0]}
+            ]
+            a = self.bot.movement(o, o["self"])
+            self.assertFalse(self.bot.evading)
+            self.assertEqual(a["move"], [0.0, 0.0])
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
