@@ -29,8 +29,9 @@ FLAGS = {
     "cover": True,            # seek cover when inside the zone and threatened
     "los_gate": True,         # gate fire[i] on world.has_los(src, tp)
     "cubes": True,            # 20 m cube-seeking
+    "early_weapon": True,     # H1: path-verified 85 m unpressured local-floor pickup detour (official server A/B vs 2.94)
     # Keep the flags below False (verified in 48-match 1-copy bot:Bot=1 ablations against e39d414 = 9.25):
-    "early_weapon": False,    # 210 m pickup detour (-1.15 pts in 1-copy sim: exposed long-range walks without A*)
+    "safe_laser": False,      # gate laser charge on LOS, no cover_goal, hp>140 (-0.23 pts in 1-copy sim: 9.02 vs 9.25)
     "heal": False,            # HEAL_COVER ceasefire (-0.44 pts in 1-copy sim)
     "kite": False,            # open-field kite / 0.60 settle (-1.94 pts; overrides loot_goal)
     "sound": False,           # face recent "near" sounds in idle_aim (0.00 delta)
@@ -81,12 +82,12 @@ class Bot:
 
         self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
-        self.seen_pickups = {}  # pickup id -> (t, pickup_dict)
         self.bad_pickups = {}   # pickup id -> t_expire blacklist
         self.aggressors = {}    # attacker id -> t it last damaged us
         self.threat = None      # (t, bearing) of the last non-zone damage
         self.threat_id = None
         self.cover_threats = []
+        self.cover_exposed = False
         self.last_sound: Optional[Tuple[float, float]] = None
         self.healing = False
         self.last_damaged_t = -99.0
@@ -97,9 +98,10 @@ class Bot:
         self.dt = 0.1
         self.loot_goal = None   # (x, y) of a pickup to walk to, set by choose_take
         self.loot_goal_id = None
-        self.progress_anchor: Optional[Tuple[float, float, float, float]] = None
+        self.progress_anchor: Optional[Tuple[float, float, float, float, Optional[float]]] = None
         self.cover_goal: Optional[Tuple[float, float]] = None
         self.cover_until = -1.0
+        self.cover_retry_at = -1.0
         self.move_yaw = None    # yaw we are walking along, None when holding still
         self.stuck_s = 0.0
         self.unstick_until = -1.0
@@ -142,33 +144,16 @@ class Bot:
                 if target == self.threat_id:
                     self.threat = None
                     self.threat_id = None
-                self.cover_goal = None
-                self.cover_threats = []
-            elif e.get("type") == "took":
-                self.seen_pickups.pop(e.get("id"), None)
+                    self.cover_goal = None
+                    self.cover_threats = []
             elif e.get("type") == "take_failed":
                 pid = e.get("id")
-                self.seen_pickups.pop(pid, None)
                 if pid is not None:
                     self.bad_pickups[pid] = t + 15.0
         cutoff = t - self.memory_s
         self.seen = {k: v for k, v in self.seen.items() if v[0] >= cutoff}
         self.aggressors = {k: v for k, v in self.aggressors.items() if v >= t - AGGRO_MEMORY_S}
         self.bad_pickups = {k: v for k, v in self.bad_pickups.items() if v > t}
-
-        if FLAGS.get("early_weapon", False):
-            vis_ids = set()
-            for p in obs.get("pickups", ()):
-                pid = p["id"]
-                vis_ids.add(pid)
-                self.seen_pickups[pid] = (t, p)
-            mx, my, mz = obs["self"]["pos"]
-            for pid, (pt, p) in list(self.seen_pickups.items()):
-                if t - pt > 20.0:
-                    del self.seen_pickups[pid]
-                elif pid not in vis_ids and math.hypot(p["pos"][0] - mx, p["pos"][1] - my) <= 35.0:
-                    if self.world is None or self.world.has_los((mx, my, mz + 8.0), (p["pos"][0], p["pos"][1], p["pos"][2] + 1.0)):
-                        del self.seen_pickups[pid]
 
         me = obs["self"]
         if not FLAGS.get("heal", False) or not me["in_zone"]:
@@ -202,7 +187,7 @@ class Bot:
     # ------------------------------------------------------------------ upgrades
     def choose_pick(self, obs: mf.Observation) -> dict:
         offer = obs.get("offer")
-        if not offer:
+        if not offer or not offer.get("choices"):
             return {}
         ids = [c["id"] for c in offer["choices"]]
         for want in UPGRADE_PREF:
@@ -223,19 +208,13 @@ class Bot:
         cx, cy = zone["next_center"]
         inner = zone["next_radius"] * 0.8
         early_w = FLAGS.get("early_weapon", False)
-        max_detour = 210.0 if early_w else LOOT_DETOUR_M
-        walk_spd = max(1.0, me["stats"].get("walk_speed", 11.7))
-        time_avail = max(0.0, zone["shrink_end"] - obs["t"])
+        max_detour = 85.0 if early_w else LOOT_DETOUR_M
+        st = me["stats"]
+        mr, mh = st.get("radius"), st.get("height")
+        enemy_has_los: Optional[bool] = None
 
-        candidates = list(obs["pickups"])
-        if early_w:
-            vis_ids = {p["id"] for p in candidates}
-            for pid, (_, p) in self.seen_pickups.items():
-                if pid not in vis_ids:
-                    candidates.append(p)
-
-        best, best_score, best_d = None, max_detour, math.inf
-        for p in candidates:
+        best, best_d = None, max_detour
+        for p in obs["pickups"]:
             pid = p["id"]
             if pid in self.bad_pickups:
                 continue
@@ -243,29 +222,35 @@ class Bot:
                 continue
             px, py, pz = p["pos"][0], p["pos"][1], p["pos"][2]
             d = math.hypot(px - x, py - y)
+            if d >= best_d:
+                continue
             if d <= self.reach:
                 if abs(pz - z) > 4.0:
                     continue
             else:
+                if early_w and d > LOOT_DETOUR_M:
+                    if enemy_has_los is None:
+                        me_eye = (x, y, z + st.get("eye_height", 8.0))
+                        enemy_has_los = any(
+                            m["kind"] == "mech"
+                            and (self.world is None or self.world.has_los(me_eye, (m["pos"][0], m["pos"][1], m["pos"][2] + 8.0)))
+                            for m in obs["mechs"]
+                        )
+                    if enemy_has_los:
+                        continue
                 if early_w and self.world is not None:
                     # Check pickup height against its own local terrain floor (fixes hill rejection bug)
                     if abs(pz - self.world.ground_z(px, py)) > 2.5:
                         continue
                 elif abs(pz - z) > 4.0:
                     continue
-                d_center = math.hypot(px - cx, py - cy)
-                if d_center > inner:
-                    if not early_w:
-                        continue
-                    d_back = d_center - inner
-                    if not me["in_zone"] or d_center > zone["radius"] * 0.90 or ((d + d_back) / walk_spd) > 0.65 * time_avail:
-                        continue
-                elif early_w and time_avail > 0 and (d / walk_spd) > 0.80 * time_avail and math.hypot(x - cx, y - cy) > inner:
+                if math.hypot(px - cx, py - cy) > inner:
                     continue
-
-            score = d * (0.92 if (early_w and p["kind"] == "laser") else 1.0)
-            if score < best_score:
-                best, best_score, best_d = p, score, d
+                if early_w and self.world is not None:
+                    if not (self.world.is_walkable(px, py, pz, radius=mr, height=mh)
+                            and self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh)):
+                        continue
+            best, best_d = p, d
         if best is None:
             return {}
         self.loot_goal = (best["pos"][0], best["pos"][1])
@@ -325,7 +310,14 @@ class Bot:
         eye_h = st.get("eye_height", 8.0)
         mr, mh = st.get("radius"), st.get("height")
         cur_eye = (x, y, z + eye_h)
-        exposed_threats = [te for te in threats if self.world.has_los(cur_eye, te)]
+        exposed_threats = []
+        unexposed_threats = []
+        for te in threats:
+            if self.world.has_los(cur_eye, te):
+                exposed_threats.append(te)
+            else:
+                unexposed_threats.append(te)
+        self.cover_exposed = bool(exposed_threats)
         if pursuing:
             gx, gy = self.cover_goal
             gz = self.world.support_z(gx, gy, z)
@@ -335,44 +327,51 @@ class Bot:
                     and self.world.path_clear(me["pos"], (gx, gy, gz), radius=mr, height=mh)):
                 self.cover_threats = threats
                 return self.cover_goal
-        if not (recent_hit or proactive) or not exposed_threats or (self.cover_goal is None and t < self.cover_until):
+        if not (recent_hit or proactive) or not exposed_threats or (self.cover_goal is None and t < self.cover_retry_at):
             self.cover_goal = None
             return None
 
         base_angle = math.atan2(cy - y, cx - x)
-        candidates: List[Tuple[float, float]] = []
         radii = (12.0, 24.0, 36.0, 48.0) if FLAGS.get("proactive_cover", False) else (12.0, 24.0, 36.0)
-        for r in radii:
-            for k in range(12):
-                ang = base_angle + TAU * k / 12.0
-                candidates.append((x + r * math.cos(ang), y + r * math.sin(ang)))
+        n_threats = len(threats)
+        n_exposed = len(exposed_threats)
 
         best_pos: Optional[Tuple[float, float]] = None
         best_score = -math.inf
-        for px, py in candidates:
-            d_center = math.hypot(px - cx, py - cy)
-            if inner > 3.0 and d_center > inner:
-                continue
-            pz = self.world.support_z(px, py, z)
-            cand_eye = (px, py, pz + eye_h)
-            if any(self.world.has_los(cand_eye, t_eye) for t_eye in exposed_threats):
-                continue
-            hidden = sum(1 for t_eye in threats if not self.world.has_los(cand_eye, t_eye))
-            travel = math.hypot(px - x, py - y)
-            score = hidden * 100.0 - travel * 1.0 - d_center * 0.25
-            if score <= best_score:
-                continue
-            if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
-                continue
-            if not self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh):
-                continue
-            best_score = score
-            best_pos = (px, py)
+        for r in radii:
+            for k in range(12):
+                ang = base_angle + TAU * k / 12.0
+                px = x + r * math.cos(ang)
+                py = y + r * math.sin(ang)
+                d_center = math.hypot(px - cx, py - cy)
+                if inner > 3.0 and d_center > inner:
+                    continue
+                if n_threats * 100.0 - r - d_center * 0.25 <= best_score:
+                    continue
+                pz = self.world.support_z(px, py, z)
+                cand_eye = (px, py, pz + eye_h)
+                if any(self.world.has_los(cand_eye, t_eye) for t_eye in exposed_threats):
+                    continue
+                hidden = n_exposed + sum(1 for t_eye in unexposed_threats if not self.world.has_los(cand_eye, t_eye))
+                score = hidden * 100.0 - r - d_center * 0.25
+                if score <= best_score:
+                    continue
+                if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
+                    continue
+                if not self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh):
+                    continue
+                best_score = score
+                best_pos = (px, py)
 
         self.cover_goal = best_pos
         self.cover_threats = threats
-        travel_s = math.dist((x, y), best_pos) / st["walk_speed"] if best_pos else 0.0
-        self.cover_until = t + (travel_s + COVER_HOLD_S if best_pos else 0.4)
+        if best_pos is not None:
+            travel_s = math.dist((x, y), best_pos) / st["walk_speed"]
+            self.cover_until = t + travel_s + COVER_HOLD_S
+            self.cover_retry_at = -1.0
+        else:
+            self.cover_until = -1.0
+            self.cover_retry_at = t + 0.4
         return self.cover_goal
 
     def choose_kite(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Tuple[Optional[Tuple[float, float]], float]:
@@ -513,7 +512,8 @@ class Bot:
         else:
             settle = max(zone["next_radius"] * 0.5, 3.0)
 
-        self.late = d > inner and (d - inner) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
+        late_r = max(inner, 4.0) if zone["next_radius"] == 0 else inner
+        self.late = d > late_r and (d - late_r) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
         kite_boost = False
         goal = None
         if not me["in_zone"] or d > inner:
@@ -522,9 +522,7 @@ class Bot:
         else:
             cover = self.choose_cover(obs, me, cx, cy, inner)
             if cover is not None:
-                eye = (x, y, me["pos"][2] + me["stats"]["eye_height"])
-                if (math.hypot(cover[0] - x, cover[1] - y) <= COVER_REACH_M
-                        and all(not self.world.has_los(eye, te) for te in self.cover_threats)):
+                if math.hypot(cover[0] - x, cover[1] - y) <= COVER_REACH_M and not self.cover_exposed:
                     goal = None
                 else:
                     goal = cover
@@ -547,7 +545,7 @@ class Bot:
                         if self.world is not None:
                             mr, mh = me["stats"].get("radius"), me["stats"].get("height")
                             sx, sy = x + 8.0 * dx, y + 8.0 * dy
-                            sz = self.world.ground_z(sx, sy)
+                            sz = self.world.support_z(sx, sy, me["pos"][2])
                             if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
                                     and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
                                 dx, dy = -dx, -dy
@@ -562,14 +560,17 @@ class Bot:
                         kite_boost = strafe_boost
                     elif self.loot_goal is not None:
                         goal = self.loot_goal
-                    elif FLAGS.get("cubes", True) and me.get("cubes", 0) < self.cfg["cubes"]["stat_cap"]:
-                        candidates = [c["pos"] for c in obs["cubes"]
-                                      if abs(c["pos"][2] - me["pos"][2]) <= 4
-                                      and math.dist(c["pos"][:2], (cx, cy)) <= inner
-                                      and math.dist(c["pos"][:2], (x, y)) <= 20]
-                        if candidates:
-                            best_c = min(candidates, key=lambda pos: math.dist(pos[:2], (x, y)))
-                            goal = (best_c[0], best_c[1])
+                    elif FLAGS.get("cubes", True) and me.get("cubes", 0) < self.cfg["cubes"].get("stat_cap", 10):
+                        mz = me["pos"][2]
+                        best_cd = 20.0
+                        for c in obs["cubes"]:
+                            cp = c["pos"]
+                            if abs(cp[2] - mz) > 4.0:
+                                continue
+                            cd = math.hypot(cp[0] - x, cp[1] - y)
+                            if cd <= best_cd and math.hypot(cp[0] - cx, cp[1] - cy) <= inner:
+                                best_cd = cd
+                                goal = (cp[0], cp[1])
                 if goal is None and cover is None and d > settle:
                     goal = (cx, cy)
 
@@ -582,15 +583,15 @@ class Bot:
 
         if FLAGS.get("early_weapon", False) and self.loot_goal is not None and goal == self.loot_goal:
             goal_d = math.hypot(goal[0] - x, goal[1] - y)
-            if self.progress_anchor is None:
-                self.progress_anchor = (t, x, y, goal_d)
+            if self.progress_anchor is None or self.progress_anchor[4] != self.loot_goal_id:
+                self.progress_anchor = (t, x, y, goal_d, self.loot_goal_id)
             elif t - self.progress_anchor[0] >= 2.2:
                 net_disp = math.hypot(x - self.progress_anchor[1], y - self.progress_anchor[2])
                 goal_prog = self.progress_anchor[3] - goal_d
                 if net_disp < 3.0 and goal_prog < 2.0 and goal_d > 4.5 and self.loot_goal_id is not None:
                     self.bad_pickups[self.loot_goal_id] = t + 15.0
                     self.loot_goal = None
-                self.progress_anchor = (t, x, y, goal_d)
+                self.progress_anchor = (t, x, y, goal_d, self.loot_goal_id)
         else:
             self.progress_anchor = None
 
@@ -633,11 +634,13 @@ class Bot:
                 continue
             tp, _, _ = self.body(m)
             dist = math.dist(src, tp)
-            los = (self.world is None) or self.world.has_los(src, tp)
             hp_frac = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0))
             s = dist * (0.5 + 0.5 * hp_frac)
             if m["kind"] == "npc":
                 s += NPC_PENALTY_M
+            if s >= best_s:
+                continue
+            los = (self.world is None) or self.world.has_los(src, tp)
             if not los:
                 s += 500.0
             if s < best_s:
@@ -703,9 +706,16 @@ class Bot:
 
         # Aim for one primary weapon: a ready/charging laser (hitscan, direct), else the gun (led).
         laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
-        can_charge = (laser is not None and laser["cooldown"] <= 0
-                      and dist <= laser["stats"]["range"] and me["in_zone"]
-                      and not self.late and not self.healing)
+        if FLAGS.get("safe_laser", False):
+            can_charge = (laser is not None and laser["cooldown"] <= 0
+                          and dist <= laser["stats"]["range"] and me["in_zone"]
+                          and has_los and self.cover_goal is None
+                          and target.get("hp", 1400.0) > 140.0
+                          and not self.late and not self.healing)
+        else:
+            can_charge = (laser is not None and laser["cooldown"] <= 0
+                          and dist <= laser["stats"]["range"] and me["in_zone"]
+                          and not self.late and not self.healing)
         laser_primary = laser is not None and dist <= laser["stats"]["range"] and (
             laser.get("charge", 0) > 0 or can_charge)
         yaw, pitch = direct if laser_primary or gun is None else led

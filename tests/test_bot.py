@@ -158,6 +158,7 @@ class Geometry(unittest.TestCase):
 
 class Decisions(unittest.TestCase):
     def setUp(self):
+        B.mf.draw.clear()
         self.bot = B.Bot(copy.deepcopy(HELLO))
 
     def test_pick_preference(self):
@@ -580,27 +581,72 @@ class Decisions(unittest.TestCase):
             o = make_obs(in_zone=True, hp=1400, max_hp=1400)
             x, y, z = o["self"]["pos"]
             o["zone"].update(next_center=[x, y], next_radius=300.0, shrink_end=o["t"] + 80.0)
-            # Place a laser 110m away (> old 40m cutoff) on ground level at its own coordinates
-            px, py = x + 110.0, y
+            # Place a laser 75m away (> 40m baseline, <= 85m cap) on ground level at its own coordinates
+            px, py = x + 75.0, y
             pz = WORLD.ground_z(px, py)
+            self.assertTrue(WORLD.is_walkable(px, py, pz))
+            self.assertTrue(WORLD.path_clear((x, y, z), (px, py, pz)))
             o["pickups"] = [{"id": 8999, "kind": "laser", "pos": [px, py, pz]}]
             o["mechs"] = []
             bot.update_memory(o)
             bot.choose_take(o, o["self"])
             self.assertEqual(bot.loot_goal, (px, py))
-            # Pickup remains remembered on the next tick even if FOV turns away
-            o2 = copy.deepcopy(o)
-            o2["t"] += 0.1
-            o2["pickups"] = []
-            bot.update_memory(o2)
-            bot.choose_take(o2, o2["self"])
-            self.assertEqual(bot.loot_goal, (px, py))
+
+            # Rejected when an enemy mech has LOS (mid-range >40m detour requires no enemy LOS)
+            ex, ey = x + 60.0, y
+            ez = WORLD.ground_z(ex, ey)
+            self.assertTrue(WORLD.has_los((x, y, z + 8.0), (ex, ey, ez + 8.0)))
+            o_los = copy.deepcopy(o)
+            o_los["mechs"] = [enemy(12, (ex, ey, ez))]
+            bot.update_memory(o_los)
+            bot.choose_take(o_los, o_los["self"])
+            self.assertIsNone(bot.loot_goal)
+
+            # Rejected when outside inner (inner = 0.8 * next_radius = 60m < 75m)
+            o_out = copy.deepcopy(o)
+            o_out["zone"].update(next_center=[x, y], next_radius=75.0)
+            bot.update_memory(o_out)
+            bot.choose_take(o_out, o_out["self"])
+            self.assertIsNone(bot.loot_goal)
+
             # Stall after 2.3s with zero displacement blacklists pickup 8999
             bot.act(copy.deepcopy(o))
             o_stall = copy.deepcopy(o)
             o_stall["t"] += 2.3
             bot.act(o_stall)
             self.assertIn(8999, bot.bad_pickups)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_safe_laser_gates_cover_goal_and_low_hp(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["safe_laser"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            x, y, z = o["self"]["pos"]
+            laser = {"kind": "laser", "cooldown": 0, "charge": 0,
+                     "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            o["self"]["weapons"] = [o["self"]["weapons"][0], laser]
+            o["self"]["aim"] = [0.0, 0.0]
+
+            # Normal healthy enemy in LOS with no cover_goal: laser starts charging
+            o["mechs"] = [enemy(5, (x + 100, y, z))]
+            bot.cover_goal = None
+            bot.update_memory(o)
+            self.assertTrue(bot.combat(o, o["self"])["fire"][1])
+
+            # While cover_goal is set: laser does not start charging
+            bot.cover_goal = (x - 10.0, y)
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+
+            # When target HP <= 140: laser does not start charging (let gun finish)
+            bot.cover_goal = None
+            o["mechs"][0]["hp"] = 140.0
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
+            o["mechs"][0]["hp"] = 100.0
+            self.assertFalse(bot.combat(o, o["self"])["fire"][1])
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
