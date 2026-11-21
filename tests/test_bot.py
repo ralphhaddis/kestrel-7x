@@ -280,6 +280,77 @@ class Decisions(unittest.TestCase):
         finally:
             B.FLAGS["cover"] = old_cover
 
+    def test_cover_route_survives_hit_timeout_and_checks_actual_position(self):
+        o = make_obs(in_zone=True)
+        me = o["self"]
+        def place(x, y):
+            me["pos"] = [x, y, WORLD.ground_z(x, y)]
+        place(18, -70)
+        o["zone"].update(next_center=[18, -70], next_radius=200)
+        o["mechs"] = [enemy(7, (-29.2, -74, WORLD.ground_z(-29.2, -74)))]
+        o["events"] = [dict(type="damaged", weapon="gun", by=7, bearing=math.pi)]
+        self.bot.update_memory(o)
+        # The cover point lies just beyond the building corner.
+        self.bot.cover_goal = (24, -80.3923)
+        self.bot.cover_until = o["t"] + 4
+        place(22.8, -78.3138)
+        o["events"] = []
+        o["t"] += 2.1
+        self.bot.update_memory(o)
+        self.assertGreater(math.hypot(*self.bot.movement(o, me)["move"]), 0)
+        self.assertEqual(self.bot.cover_goal, (24, -80.3923))
+        place(*self.bot.cover_goal)
+        self.assertEqual(self.bot.movement(o, me)["move"], [0, 0])
+
+    def test_roof_path_and_corner_ray(self):
+        self.assertTrue(WORLD.path_clear((-113, -195, 5.82), (-112, -195, 5.82)))
+        a, b = (-87.54, -216.37, 1), (-82.74, -217.05, 1)
+        self.assertFalse(WORLD.has_los(a, b))
+        self.assertFalse(WORLD.has_los(b, a))
+
+    def test_laser_cannot_steal_gun_lead_outside_zone(self):
+        o = make_obs(in_zone=False)
+        me = o["self"]
+        x, y, z = me["pos"]
+        self.bot.world = None
+        me["weapons"][1] = dict(kind="laser", cooldown=0, charge=0,
+                                stats=HELLO["config"]["weapons"]["laser"])
+        o["mechs"] = [enemy(7, (x + 100, y, z), (0, 25, 0))]
+        a = self.bot.combat(o, me)
+        self.assertGreater(a["aim"][0], 0.08)
+        me["aim"] = a["aim"]
+        self.assertEqual(self.bot.combat(o, me)["fire"], [True, False])
+
+    def test_unreachable_elevation(self):
+        o = make_obs()
+        me = o["self"]
+        self.bot.world = None
+        x, y, z = me["pos"]
+        o["mechs"] = [enemy(7, (x + 4, y, z + 55))]
+        me["aim"] = [0, me["stats"]["max_pitch"]]
+        a = self.bot.combat(o, me)
+        self.assertEqual(a["aim"], me["aim"])
+        self.assertFalse(a["fire"][0])
+
+    def test_pickup_within_server_radius_outside_destination_margin(self):
+        o = make_obs()
+        me = o["self"]
+        x, y, z = me["pos"]
+        o["zone"].update(next_center=[x - 100, y], next_radius=5)
+        o["pickups"] = [dict(id=8111, kind="laser", pos=[x + 3.9, y, z])]
+        self.assertEqual(self.bot.choose_take(o, me), {"take": 8111})
+
+    def test_known_threats_include_unseen_attacker_and_remove_kill(self):
+        o = make_obs()
+        o["mechs"] = [enemy(7, (30, 0, 0))]
+        o["events"] = [dict(type="damaged", by=4, bearing=1.2)]
+        self.bot.update_memory(o)
+        self.assertEqual(len(self.bot.known_threats(o, o["self"])), 2)
+        o["mechs"] = []
+        o["events"] = [dict(type="kill", target=7), dict(type="kill", target=4)]
+        self.bot.update_memory(o)
+        self.assertEqual(self.bot.known_threats(o, o["self"]), [])
+
     def test_cover_disabled_flag(self):
         old_cover = B.FLAGS.get("cover", True)
         try:

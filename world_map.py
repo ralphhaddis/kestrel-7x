@@ -277,7 +277,7 @@ class WorldMap:
                         return False
         return True
 
-    def _support_z(self, x: float, y: float, cur_z: float) -> float:
+    def support_z(self, x: float, y: float, cur_z: float) -> float:
         """Compute floor height under (x, y) considering terrain and any flat prism tops <= cur_z + step_up."""
         floor_z = self.ground_z(x, y)
         z_reach = cur_z + self.step_up
@@ -312,10 +312,42 @@ class WorldMap:
             t = k * inv
             px = ax + dx * t
             py = ay + dy * t
-            if not self.is_walkable(px, py, None, radius=radius, height=height):
+            cur_z = self.support_z(px, py, cur_z)
+            if not self.is_walkable(px, py, cur_z, radius=radius, height=height):
                 return False
-            cur_z = self._support_z(px, py, cur_z)
         return True
+
+    def _blocks_ray(self, p, x, y, z, dx, dy, dz):
+        # Clip the segment to the prism's bounding box, including its vertical slab.
+        lo, hi = 0.0, 1.0
+        xmin, ymin, xmax, ymax = p["bbox"]
+        for start, delta, low, high in ((x, dx, xmin, xmax), (y, dy, ymin, ymax),
+                                        (z, dz, p["base"], p["top"])):
+            if delta == 0:
+                if start < low or start > high:
+                    return False
+                continue
+            a, b = (low - start) / delta, (high - start) / delta
+            lo, hi = max(lo, min(a, b)), min(hi, max(a, b))
+            if lo > hi:
+                return False
+        mid = (lo + hi) * 0.5
+        if self._in_prism_xy(x + mid * dx, y + mid * dy, p):
+            return True
+        # A ray can enter and exit the footprint on the same side of the midpoint.
+        for ring in (p["poly"], *p["holes"]):
+            ax, ay = ring[-1]
+            for bx, by in ring:
+                ex, ey = bx - ax, by - ay
+                det = dx * ey - dy * ex
+                if det:
+                    rx, ry = ax - x, ay - y
+                    t = (rx * ey - ry * ex) / det
+                    u = (rx * dy - ry * dx) / det
+                    if lo <= t <= hi and 0 <= u <= 1:
+                        return True
+                ax, ay = bx, by
+        return False
 
     def has_los(
         self,
@@ -342,16 +374,28 @@ class WorldMap:
 
         cell = self.cell
         grid = self.grid
+        # Visit every grid cell crossed in each x-column, even at a corner.
+        checked = set()
+        for gx in range(math.floor(min(ax, bx) / cell), math.floor(max(ax, bx) / cell) + 1):
+            if dx:
+                a = (gx * cell - ax) / dx
+                b = ((gx + 1) * cell - ax) / dx
+                y0 = ay + dy * max(0.0, min(a, b))
+                y1 = ay + dy * min(1.0, max(a, b))
+            else:
+                y0, y1 = ay, by
+            for gy in range(math.floor(min(y0, y1) / cell), math.floor(max(y0, y1) / cell) + 1):
+                for p in grid.get((gx, gy), ()):
+                    if p["id"] in checked:
+                        continue
+                    checked.add(p["id"])
+                    if self._blocks_ray(p, ax, ay, az, dx, dy, dz):
+                        return False
         x, y, z = ax, ay, az
         for _ in range(1, steps):
             x += sx
             y += sy
             z += sz
-            bucket = grid.get((int(x // cell), int(y // cell)))
-            if bucket:
-                for p in bucket:
-                    if p["base"] <= z <= p["top"] and self._in_prism_xy(x, y, p):
-                        return False
             if z < self.ground_z(x, y):
                 return False
         return True

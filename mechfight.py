@@ -528,10 +528,7 @@ def run(make_bot: Any) -> None:
             kind = msg.get("type")
             if kind == "hello":
                 draw.caps = msg.get("config", {}).get("debug", {})
-                try:
-                    bot = make_bot(msg)
-                except Exception:
-                    log(traceback.format_exc())
+                bot = make_bot(msg)
                 name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
                 _send({"type": "ready", "name": str(name)[:32]})
             elif kind == "obs":
