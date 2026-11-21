@@ -154,6 +154,7 @@ class Bot:
         self.cover_reason: Optional[str] = None
         self.cover_until = -1.0
         self.cover_retry_at = -1.0
+        self.cover_hides_prio = False
         self.settle_corner: Optional[Tuple[float, float]] = None
         self.settle_center: Optional[Tuple[float, float]] = None
         self.move_yaw = None    # yaw we are walking along, None when holding still
@@ -603,7 +604,8 @@ class Bot:
             gz = self.world.support_z(gx, gy, z)
             goal_eye = (gx, gy, gz + eye_h)
             if use_crossfire and exposed_threats:
-                still_covers = any(not self.world.has_los(goal_eye, te) for te in priority_threats)
+                check_list = priority_threats if self.cover_hides_prio else exposed_threats
+                still_covers = any(not self.world.has_los(goal_eye, te) for te in check_list)
             else:
                 still_covers = all(not self.world.has_los(goal_eye, te) for te in (exposed_threats or threats))
             if (math.hypot(gx - cx, gy - cy) <= inner
@@ -629,6 +631,7 @@ class Bot:
 
         best_pos: Optional[Tuple[float, float]] = None
         best_score = -math.inf
+        best_hides_prio = False
 
         if FLAGS.get("corner_cover", True):
             for px, py in self.world.nearby_corners(x, y, max_r=corner_max_r, limit=20):
@@ -651,6 +654,7 @@ class Bot:
                     if any(self.world.has_los(cand_eye, t_eye) for t_eye in exposed_threats):
                         continue
                     hidden = n_exposed + sum(1 for t_eye in unexposed_threats if not self.world.has_los(cand_eye, t_eye))
+                    hides_prio = False
                     score = hidden * 100.0 - r - d_center * 0.25
                 if score <= best_score:
                     continue
@@ -660,6 +664,7 @@ class Bot:
                     continue
                 best_score = score
                 best_pos = (px, py)
+                best_hides_prio = hides_prio
 
         if best_pos is None:
             for r in radii:
@@ -685,6 +690,7 @@ class Bot:
                         if any(self.world.has_los(cand_eye, t_eye) for t_eye in exposed_threats):
                             continue
                         hidden = n_exposed + sum(1 for t_eye in unexposed_threats if not self.world.has_los(cand_eye, t_eye))
+                        hides_prio = False
                         score = hidden * 100.0 - r - d_center * 0.25
                     if score <= best_score:
                         continue
@@ -694,9 +700,11 @@ class Bot:
                         continue
                     best_score = score
                     best_pos = (px, py)
+                    best_hides_prio = hides_prio
 
         self.cover_goal = best_pos
         self.cover_reason = ("reload" if reload_only else "combat") if best_pos is not None else None
+        self.cover_hides_prio = bool(best_hides_prio) if best_pos is not None else False
         self.cover_threats = threats
         if best_pos is not None:
             travel_s = math.dist((x, y), best_pos) / st["walk_speed"]
@@ -1418,7 +1426,7 @@ class Bot:
 
         steer_target = goal
         if (FLAGS.get("astar_nav", False) and self.world is not None
-                and not self.evading
+                and not self.evading and not anti_light_active
                 and t >= self.unstick_until
                 and math.hypot(goal[0] - x, goal[1] - y) > 10.0):
             nav_fixes = FLAGS.get("nav_fixes", True)

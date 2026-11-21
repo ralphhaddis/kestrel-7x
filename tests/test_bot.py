@@ -1709,19 +1709,27 @@ class Decisions(unittest.TestCase):
             bot2.update_memory(o_fin)
             self.assertIsNone(bot2.choose_cover(o_fin, o_fin["self"], mx, my, 160.0))
 
-            # 3. Priority-threat hysteresis: if closest priority threat gains LOS to cover_goal,
-            # hysteresis breaks even if a distant non-priority threat is still hidden
+            # 3. Partial-cover hysteresis: when cover only hides a non-priority threat (cover_hides_prio=False),
+            # keeping the same enemies on the next tick preserves cover without thrashing;
+            # when cover DID hide a priority threat (cover_hides_prio=True) and that closest threat
+            # gains LOS to cover_goal, hysteresis breaks even if a distant threat is still hidden.
             gx, gy = goal
             gz = WORLD.support_z(gx, gy, mz)
             eye_h = o["self"]["stats"]["eye_height"]
+            o_next = copy.deepcopy(o)
+            o_next["t"] += 0.1
+            bot.update_memory(o_next)
+            self.assertEqual(bot.choose_cover(o_next, o_next["self"], mx, my, 160.0), goal)
+
             e_close = enemy(9, (gx + 5.0, gy, WORLD.ground_z(gx + 5.0, gy)))
             o_hyst = copy.deepcopy(o)
-            o_hyst["t"] += 0.1
+            o_hyst["t"] += 0.2
             o_hyst["mechs"] = [e_close]
             o_hyst["events"] = []
             bot.seen = {7: (o_hyst["t"], e1["pos"], [0, 0, 0])}
             bot.update_memory(o_hyst)
             bot.cover_until = o_hyst["t"] + 5.0
+            bot.cover_hides_prio = True
             if WORLD.has_los((gx, gy, gz + eye_h), (e_close["pos"][0], e_close["pos"][1], e_close["pos"][2] + 8.0)):
                 # Only 1 visible mech & no hit -> proactive=False; hysteresis must break -> returns None
                 self.assertIsNone(bot.choose_cover(o_hyst, o_hyst["self"], mx, my, 160.0))
