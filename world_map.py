@@ -312,12 +312,9 @@ class WorldMap:
             t = k * inv
             px = ax + dx * t
             py = ay + dy * t
-            next_floor = self._support_z(px, py, cur_z)
-            if next_floor - cur_z > self.step_up:
+            if not self.is_walkable(px, py, None, radius=radius, height=height):
                 return False
-            cur_z = next_floor
-            if not self.is_walkable(px, py, cur_z, radius=radius, height=height):
-                return False
+            cur_z = self._support_z(px, py, cur_z)
         return True
 
     def has_los(
