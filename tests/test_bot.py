@@ -615,12 +615,14 @@ class Decisions(unittest.TestCase):
             bot.choose_take(o_los, o_los["self"])
             self.assertIsNone(bot.loot_goal)
 
-            # Rejected when outside inner (inner = 0.8 * next_radius = 60m < 75m)
+            # Rejected when outside inner (inner = 0.8 * next_radius = 60m < 75m; disable w5_safe_bound for strict inner test)
+            B.FLAGS["w5_safe_bound"] = False
             o_out = copy.deepcopy(o)
             o_out["zone"].update(next_center=[x, y], next_radius=75.0)
             bot.update_memory(o_out)
             bot.choose_take(o_out, o_out["self"])
             self.assertIsNone(bot.loot_goal)
+            B.FLAGS["w5_safe_bound"] = True
 
             # Stall after 2.3s with zero displacement blacklists pickup 8999
             bot.act(copy.deepcopy(o))
@@ -1954,6 +1956,137 @@ class Decisions(unittest.TestCase):
             o["t"] = 52.0
             a_late = bot.movement(o, o["self"])
             self.assertLess(a_late["move"][0], -0.5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w5_safe_bound_unlocks_outer_ring_cover_and_loot(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w5_safe_bound=True, cover=True, corner_cover=True, loot=True, laser_first=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            o["t"] = 10.0
+            # Spawn at d_next = 410m > strict_inner (304m), with 100s until shrink_end
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(
+                center=[mx - 280.0, my],
+                radius=560.0,
+                next_center=[mx - 410.0, my],
+                next_radius=380.0,
+                shrink_start=60.0,
+                shrink_end=110.0,
+            )
+            # 1. With w5_safe_bound=True, _safe_bound expands >= 418m so nearby laser pickup at -20m is targeted
+            px, py = mx - 20.0, my
+            pz = WORLD.ground_z(px, py)
+            o["self"]["weapons"] = [o["self"]["weapons"][0], None]
+            o["pickups"] = [{"id": 8801, "kind": "laser", "pos": [px, py, pz]}]
+            o["mechs"] = []
+            bot.update_memory(o)
+            bot.choose_take(o, o["self"])
+            self.assertEqual(bot.loot_goal, (px, py))
+
+            # 2. When damaged by enemy, cover seeking works even though d_next = 410m > 304m
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun",
+                            "bearing": math.atan2(ey - my, ex - mx), "by": 7}]
+            bot.update_memory(o)
+            bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.cover_goal)
+
+            # 3. Near shrink_end (rem_s = 10s <= 14s): _safe_bound collapses back to strict_inner (304m)
+            o["t"] = 100.0
+            self.assertAlmostEqual(bot._safe_bound(o, o["self"]), 380.0 * 0.8, places=3)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w5_laser_mastery_committed_dodge_and_no_los_drop(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w5_laser_mastery=True, evade=True, laser_opt=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=80.0)
+            o["t"] = 10.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["projectiles"] = []
+            o["events"] = []
+
+            # Enemy 100m west aiming slightly south of us (we are +0.8m north of beam -> dodges north +Y)
+            e = enemy(10, (x - 100.0, y - 0.8, z))
+            e["aim"] = [0.0, 0.0]
+            e["charging"] = True
+            e["weapons"] = ["gun", "laser"]
+            o["mechs"] = [e]
+            a1 = bot.movement(o, o["self"])
+            self.assertTrue(bot.evading)
+            self.assertGreater(a1["move"][1], 0.5)
+
+            # Next tick (t=10.1s): enemy slews aim slightly north of us (+0.015 rad -> beam center is now +0.7m north of us).
+            # Latched dodge direction must NOT flip south (-Y) into the beam!
+            o["t"] = 10.1
+            e["aim"] = [0.015, 0.0]
+            bot.update_memory(o)
+            a2 = bot.movement(o, o["self"])
+            self.assertTrue(bot.evading)
+            self.assertGreater(a2["move"][1], 0.5, "Committed laser dodge must not reverse across slewing beam")
+
+            # Hold timeout rescue: full laser charge held without LOS for >= 0.45s drops charge to restore speed
+            l_st = dict(HELLO["config"]["weapons"]["laser"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": l_st["charge"], "stats": l_st},
+            ]
+            e["charging"] = False
+            bot.target_has_los = False
+            bot.pick_target = lambda obs_arg, me_arg: e
+            for step_i in range(5):
+                o["t"] = 20.0 + step_i * 0.1
+                bot.dt = 0.1
+                ac = bot.combat(o, o["self"])
+            self.assertFalse(ac["fire"][1], "Should release/drop full-charge laser after >=0.45s without LOS")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w5_nav_mastery_blacklists_stuck_waypoint(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w5_nav_mastery=True, astar_nav=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            o["t"] = 15.0
+            mx, my = 29.5, -87.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["self"]["vel"] = [0.0, 0.0, 0.0]
+            o["zone"].update(center=[0.0, -87.0], radius=400.0, next_center=[-95.0, -87.0], next_radius=10.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+            bot.update_memory(o)
+            bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.nav_path)
+            first_wp = bot.nav_path[0]
+            wp_cell = (int(first_wp[0] // 6.0), int(first_wp[1] // 6.0))
+            # Simulate being stuck for 0.5s
+            bot.stuck_s = 0.50
+            o["t"] = 15.1
+            bot.update_memory(o)
+            bot.movement(o, o["self"])
+            self.assertIn(wp_cell, bot.bad_waypoints)
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)

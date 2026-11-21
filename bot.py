@@ -44,6 +44,9 @@ FLAGS = {
     "laser_first": True,      # W4-2: zero-mortar pickup policy (no 504-dmg cookoff), hill-floor fix, safe 75m laser detour & 35m swap
     "farm_npc": True,         # W4-4: safe 2-cube NPC farming (<45m, cubes<6, zero mechs) + 35m uncontested cube sweep
     "early_survival": True,   # W4-5: delayed Phase-1 center convergence (0.78R settle while t < shrink_start-10 and alive >= 10)
+    "w5_safe_bound": True,    # W5-1: slack-time dynamic safe boundary so d > inner doesn't disable cover/loot/micro in outer 54% spawns
+    "w5_laser_mastery": True, # W5-2: committed lateral laser dodge (no centerline ping-pong) + hold_s no-LOS timeout release
+    "w5_nav_mastery": True,   # W5-3: zero-jitter A* caching + stuck waypoint blacklisting + endgame circle mastery
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -162,6 +165,10 @@ class Bot:
         self.nav_until = -1.0
         self.evading = False
         self.evade_impacts: List[Tuple[float, float, float]] = []
+        self.laser_dodge_dir: Dict[int, Tuple[float, float]] = {}  # enemy_id -> (expires_t, side)
+        self.laser_no_los_s: float = 0.0
+        self.bad_waypoints: Dict[Tuple[int, int], float] = {}      # (wx_cell, wy_cell) -> expires_t
+        self.last_wp_pop_t: float = -99.0
         mf.log(f"{self.name}: slot {hello['slot']} seed {hello['seed']}")
 
     # ------------------------------------------------------------------ main step
@@ -212,6 +219,8 @@ class Bot:
         self.aggressors = {k: v for k, v in self.aggressors.items() if v >= t - AGGRO_MEMORY_S}
         self.bad_pickups = {k: v for k, v in self.bad_pickups.items() if v > t}
         self.bad_crates = {k: v for k, v in self.bad_crates.items() if v > t}
+        self.bad_waypoints = {k: v for k, v in self.bad_waypoints.items() if v > t}
+        self.laser_dodge_dir = {k: v for k, v in self.laser_dodge_dir.items() if v[0] > t}
 
         me = obs["self"]
         if not FLAGS.get("heal", False) or not me["in_zone"]:
@@ -364,6 +373,28 @@ class Bot:
             scores["mortar"] -= 6.0
         return scores.get(kind, 0.0)
 
+    def _safe_bound(self, obs: mf.Observation, me) -> float:
+        """Dynamic safe radius around `next_center`: expands beyond `0.8 * next_radius` while we have
+        ample slack time before `shrink_end`, so spawning or fighting in the outer ring does not
+        disable cover seeking, secondary weapon looting, or post-hit evasion."""
+        zone = obs["zone"]
+        inner = zone["next_radius"] * 0.8
+        if not (FLAGS.get("w5_safe_bound", True) and me["in_zone"]):
+            return inner
+        t = obs["t"]
+        rem_s = max(0.0, float(zone.get("shrink_end", t)) - t)
+        walk_spd = max(1.0, float(me["stats"].get("walk_speed", 11.7)))
+        # Keep a 14s safety cushion before shrink_end
+        slack_m = max(0.0, (rem_s - 14.0) * walk_spd * 0.72)
+        if slack_m <= 0.0:
+            return inner
+        cx, cy = zone["next_center"]
+        zcx, zcy = zone["center"]
+        c_shift = math.hypot(cx - zcx, cy - zcy)
+        cur_safe = max(inner, float(zone["radius"]) - c_shift - 12.0)
+        # Never expand beyond 1.45 * next_radius so late small circles stay bounded
+        return min(cur_safe, inner + slack_m, float(zone["next_radius"]) * 1.45)
+
     def choose_take(self, obs: mf.Observation, me) -> dict:
         """Pick a pickup to walk to (self.loot_goal) and `take` it once in reach, or swap slot 1."""
         self.loot_goal = None
@@ -378,7 +409,7 @@ class Bot:
         x, y, z = me["pos"]
         zone = obs["zone"]
         cx, cy = zone["next_center"]
-        inner = zone["next_radius"] * 0.8
+        inner = self._safe_bound(obs, me)
         use_tri = FLAGS.get("weapon_tri", True)
 
         if None not in me["weapons"]:
@@ -895,8 +926,11 @@ class Bot:
                 mortar_threats.append((ix, iy, zf, t_imp, danger_r))
                 self.evade_impacts.append((ix, iy, zf))
 
-        # B. Detect charging-laser threats: (ex, ey, emz, dx, dy, left_x, left_y, perp_dist)
-        laser_threats: List[Tuple[float, float, float, float, float, float, float, float]] = []
+        # B. Detect charging-laser threats: (enemy_id, ex, ey, emz, dx, dy, left_x, left_y, perp_dist, pref_side)
+        w5_laser = FLAGS.get("w5_laser_mastery", True)
+        t_now = obs["t"]
+        vx_me, vy_me = me["vel"][0], me["vel"][1]
+        laser_threats: List[Tuple[int, float, float, float, float, float, float, float, float, float]] = []
         base_muzzle_h = self.cfg["mech"].get("muzzle_height", 7.0)
         for m in chargers:
             ep = m["pos"]
@@ -920,7 +954,54 @@ class Bot:
                 continue
             dx, dy = math.cos(eyaw), math.sin(eyaw)
             left_x, left_y = -dy, dx
-            laser_threats.append((ep[0], ep[1], emz, dx, dy, left_x, left_y, perp_xy))
+            left_dot = (x - ep[0]) * left_x + (y - ep[1]) * left_y
+            mid = int(m["id"])
+            if w5_laser:
+                latched = self.laser_dodge_dir.get(mid)
+                if latched is not None and latched[0] > t_now:
+                    pref_side = latched[1]
+                    if self.world is not None:
+                        s_pos = (x + 12.0 * pref_side * left_x, y + 12.0 * pref_side * left_y)
+                        s_neg = (x - 12.0 * pref_side * left_x, y - 12.0 * pref_side * left_y)
+                        z_pos = self.world.support_z(s_pos[0], s_pos[1], z)
+                        z_neg = self.world.support_z(s_neg[0], s_neg[1], z)
+                        ok_pos = self.world.is_walkable(s_pos[0], s_pos[1], z_pos, radius=mr, height=mh) and self.world.path_clear(me["pos"], (s_pos[0], s_pos[1], z_pos), radius=mr, height=mh)
+                        if not ok_pos:
+                            ok_neg = self.world.is_walkable(s_neg[0], s_neg[1], z_neg, radius=mr, height=mh) and self.world.path_clear(me["pos"], (s_neg[0], s_neg[1], z_neg), radius=mr, height=mh)
+                            if ok_neg:
+                                pref_side = -pref_side
+                    # Refresh latch while enemy continues charging
+                    self.laser_dodge_dir[mid] = (t_now + 0.9, pref_side)
+                else:
+                    # Pick committed lateral escape direction:
+                    # 1. If one perpendicular step breaks LOS or is clear while the other is blocked, prefer it
+                    # 2. If already moving laterally (>2.5 m/s), keep momentum so we don't decelerate across beam
+                    # 3. Otherwise dodge away from current beam centerline
+                    v_dot = vx_me * left_x + vy_me * left_y
+                    if abs(left_dot) > 1.8:
+                        pref_side = 1.0 if left_dot >= 0.0 else -1.0
+                    elif abs(v_dot) > 2.5:
+                        pref_side = 1.0 if v_dot >= 0.0 else -1.0
+                    else:
+                        pref_side = 1.0 if left_dot >= 0.0 else -1.0
+                    if self.world is not None:
+                        s_pos = (x + 12.0 * pref_side * left_x, y + 12.0 * pref_side * left_y)
+                        s_neg = (x - 12.0 * pref_side * left_x, y - 12.0 * pref_side * left_y)
+                        z_pos = self.world.support_z(s_pos[0], s_pos[1], z)
+                        z_neg = self.world.support_z(s_neg[0], s_neg[1], z)
+                        ok_pos = self.world.is_walkable(s_pos[0], s_pos[1], z_pos, radius=mr, height=mh) and self.world.path_clear(me["pos"], (s_pos[0], s_pos[1], z_pos), radius=mr, height=mh)
+                        ok_neg = self.world.is_walkable(s_neg[0], s_neg[1], z_neg, radius=mr, height=mh) and self.world.path_clear(me["pos"], (s_neg[0], s_neg[1], z_neg), radius=mr, height=mh)
+                        if ok_neg and not ok_pos:
+                            pref_side = -pref_side
+                        elif ok_pos and ok_neg:
+                            hide_pos = not self.world.has_los((ep[0], ep[1], emz), (s_pos[0], s_pos[1], z_pos + eye_h))
+                            hide_neg = not self.world.has_los((ep[0], ep[1], emz), (s_neg[0], s_neg[1], z_neg + eye_h))
+                            if hide_neg and not hide_pos:
+                                pref_side = -pref_side
+                    self.laser_dodge_dir[mid] = (t_now + 0.9, pref_side)
+            else:
+                pref_side = 1.0 if left_dot >= 0.0 else -1.0
+            laser_threats.append((mid, ep[0], ep[1], emz, dx, dy, left_x, left_y, perp_xy, pref_side))
 
         if not mortar_threats and not laser_threats:
             return None, False
@@ -932,11 +1013,9 @@ class Bot:
                 angles.append(math.atan2(cy - y, cx - x))
             else:
                 angles.append(math.atan2(y - iy, x - ix))
-        for ex, ey, _, _, _, left_x, left_y, _ in laser_threats:
-            left_dot = (x - ex) * left_x + (y - ey) * left_y
-            side = 1.0 if left_dot >= 0.0 else -1.0
-            angles.append(math.atan2(side * left_y, side * left_x))
-            angles.append(math.atan2(-side * left_y, -side * left_x))
+        for _, ex, ey, _, _, _, left_x, left_y, _, pref_side in laser_threats:
+            angles.append(math.atan2(pref_side * left_y, pref_side * left_x))
+            angles.append(math.atan2(-pref_side * left_y, -pref_side * left_x))
         for k in range(8):
             angles.append(TAU * k / 8.0)
 
@@ -988,14 +1067,21 @@ class Bot:
                     score += 120.0 + min(md - dr, 10.0)
                 else:
                     score += md * 6.0
-            for ex, ey, emz, _, _, left_x, left_y, _ in laser_threats:
+            for _, ex, ey, emz, _, _, left_x, left_y, _, pref_side in laser_threats:
                 cur_dot = (x - ex) * left_x + (y - ey) * left_y
                 cand_dot = (kx - ex) * left_x + (ky - ey) * left_y
-                score += min(abs(cand_dot), 18.0) * 8.0
-                if (cur_dot > 0.5 and cand_dot < 0.0) or (cur_dot < -0.5 and cand_dot > 0.0):
-                    score -= 60.0
+                if w5_laser:
+                    # Reward moving along the latched escape side; strongly penalize reversing across beam
+                    latched_prog = (cand_dot - cur_dot) * pref_side
+                    score += latched_prog * 9.0 + min(abs(cand_dot), 18.0) * 4.0
+                    if latched_prog < -1.0:
+                        score -= 95.0
+                else:
+                    score += min(abs(cand_dot), 18.0) * 8.0
+                    if (cur_dot > 0.5 and cand_dot < 0.0) or (cur_dot < -0.5 and cand_dot > 0.0):
+                        score -= 60.0
                 if self.world is not None and not self.world.has_los((ex, ey, emz), (kx, ky, kz + eye_h)):
-                    score += 90.0
+                    score += 110.0 if w5_laser else 90.0
             if cur_span > 2.618:
                 cand_span = self._angular_span(kx, ky, arc_pts)
                 score += (cur_span - cand_span) * 60.0
@@ -1014,7 +1100,7 @@ class Bot:
             return None, False
 
         imminent_mortar = any(t_imp <= 1.8 for _, _, _, t_imp, _ in mortar_threats)
-        tight_laser = any(pd <= mr + 3.5 for *_, pd in laser_threats)
+        tight_laser = any(pd <= mr + (4.5 if w5_laser else 3.5) for *_, pd, _ in laser_threats)
         should_boost = bool(me.get("grounded", True)) and (me["energy"] > 15.0) and (imminent_mortar or tight_laser)
         return best_pt, should_boost
 
@@ -1200,7 +1286,8 @@ class Bot:
         zone = obs["zone"]
         cx, cy = zone["next_center"]
         d = math.hypot(cx - x, cy - y)
-        inner = zone["next_radius"] * 0.8     # comfortably inside the next circle
+        strict_inner = zone["next_radius"] * 0.8     # comfortably inside the next circle
+        inner = self._safe_bound(obs, me)
         # NOTE: Do not widen settle to 0.60 * next_radius by default (coupled to FLAGS['kite']);
         # standing still at 60% instead of rotating to 50% early hurt placement (e.g. seed 47).
         if FLAGS.get("kite", False) and zone["next_radius"] > 100.0 and obs.get("alive", 16) > 4:
@@ -1214,8 +1301,9 @@ class Bot:
             settle = max(zone["next_radius"] * 0.5, 3.0)
 
         w4c = FLAGS.get("w4_combat", True)
+        w5_nav = FLAGS.get("w5_nav_mastery", True)
         agg_drops = FLAGS.get("aggressive_drops", True)
-        late_r = max(inner, 4.0) if zone["next_radius"] == 0 else inner
+        late_r = max(strict_inner, 4.0) if zone["next_radius"] == 0 else strict_inner
         self.late = d > late_r and (d - late_r) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
         self.evading = False
         self.crate_target = None
@@ -1230,7 +1318,7 @@ class Bot:
             self.evading = True
             goal = evade_goal
             kite_boost = evade_boost
-        elif not me["in_zone"] or d > inner:
+        elif not me["in_zone"] or self.late or d > inner:
             self.cover_goal = None
             self.cover_goal_exposed = False
             goal = (cx, cy)
@@ -1432,17 +1520,34 @@ class Bot:
                 self.nav_path = None
                 self.nav_goal = None
             else:
-                replan = (self.nav_goal is None
-                          or t >= self.nav_until
-                          or math.hypot(goal[0] - self.nav_goal[0], goal[1] - self.nav_goal[1]) > 12.0)
+                if w5_nav and self.stuck_s >= 0.45 and self.nav_path and (t - self.last_wp_pop_t) >= 0.9:
+                    self.last_wp_pop_t = t
+                    wx0, wy0 = self.nav_path[0]
+                    self.bad_waypoints[(int(wx0 // 6.0), int(wy0 // 6.0))] = t + 12.0
+                    self.nav_path.pop(0)
+                    if not self.nav_path:
+                        self.nav_until = -1.0
+                replan = (
+                    self.nav_goal is None
+                    or math.hypot(goal[0] - self.nav_goal[0], goal[1] - self.nav_goal[1]) > 12.0
+                    or (not self.nav_path and t >= self.nav_until)
+                    or (not w5_nav and t >= self.nav_until)
+                )
                 if replan:
-                    self.nav_path = self.world.find_path((x, y), goal, max_expansions=800)
+                    raw_path = self.world.find_path((x, y), goal, max_expansions=800)
+                    if w5_nav and raw_path and len(raw_path) > 1 and (int(raw_path[0][0] // 6.0), int(raw_path[0][1] // 6.0)) in self.bad_waypoints:
+                        self.nav_path = raw_path[1:]
+                    else:
+                        self.nav_path = raw_path
                     self.nav_goal = goal
                     self.nav_until = t + 1.5
                 if self.nav_path:
                     while len(self.nav_path) > 1 and math.hypot(self.nav_path[0][0] - x, self.nav_path[0][1] - y) < 6.0:
                         self.nav_path.pop(0)
-                    steer_target = self.world.next_waypoint(me["pos"], self.nav_path)
+                    if w5_nav and (t - self.last_wp_pop_t) < 1.2:
+                        steer_target = self.nav_path[0]
+                    else:
+                        steer_target = self.world.next_waypoint(me["pos"], self.nav_path)
 
         yaw = math.atan2(steer_target[1] - y, steer_target[0] - x)
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.
@@ -1709,7 +1814,23 @@ class Bot:
         gun = next((w for w in weapons if w and w["kind"] == "gun"), None)
         laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
         mortar = next((w for w in weapons if w and w["kind"] == "mortar"), None)
-        hold_ok = (not FLAGS.get("laser_opt", True)) or (me["in_zone"] and not self.evading and not self.late)
+        w5_laser = FLAGS.get("w5_laser_mastery", True)
+        if laser is not None and laser.get("charge", 0.0) > 0.0:
+            if target is None or not self.target_has_los:
+                self.laser_no_los_s += self.dt
+            else:
+                self.laser_no_los_s = 0.0
+        else:
+            self.laser_no_los_s = 0.0
+        drop_occluded_charge = (
+            w5_laser
+            and laser is not None
+            and (
+                (laser.get("charge", 0.0) >= laser["stats"].get("charge", 0.75) and self.laser_no_los_s >= 0.45)
+                or (self.laser_no_los_s >= 0.30 and me["hp"] < 0.60 * me["max_hp"] and (obs["t"] - self.last_damaged_t) < 0.6)
+            )
+        )
+        hold_ok = ((not FLAGS.get("laser_opt", True)) or (me["in_zone"] and not self.evading and not self.late)) and not drop_occluded_charge
 
         if target is None:
             for i, w in enumerate(weapons):
