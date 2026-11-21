@@ -1081,20 +1081,34 @@ class Decisions(unittest.TestCase):
             a_cd2 = bot.combat(o, me)
             self.assertEqual(a_cd2["fire"], [True, False])
 
-            # Remembered enemy lob when target is None (age <= 3.5s, 18 <= dist <= 190)
+            # A recent remembered enemy can still receive a speculative lob when target is None.
             mortar_w["cooldown"] = 0.0
             o["mechs"] = []
-            bot.seen = {7: (o["t"] - 1.5, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
+            bot.seen = {7: (o["t"] - 0.5, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
             a_mem = bot.combat(o, me)
             self.assertGreater(a_mem["aim"][1], 0.8)
             me["aim"] = a_mem["aim"]
             a_mem2 = bot.combat(o, me)
             self.assertEqual(a_mem2["fire"], [False, True])
 
-            # Stale memory (> 3.5s) does not fire
-            bot.seen = {7: (o["t"] - 4.0, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
+            # The freshness cutoff is inclusive at exactly one second.
+            bot.seen = {7: (o["t"] - 1.0, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
+            a_exact_cutoff = bot.combat(o, me)
+            self.assertEqual(a_exact_cutoff["fire"], [False, True])
+
+            # Memory older than one second is too stale for a speculative shot.
+            bot.seen = {7: (o["t"] - 1.01, [x + 140.0, y, z], [0.0, 0.0, 0.0])}
             a_stale = bot.combat(o, me)
             self.assertEqual(a_stale["fire"], [False, False])
+
+            # A visible current target remains eligible for mortar fire regardless of memory age.
+            o["mechs"] = [enemy(7, (x + 100.0, y, z))]
+            me["hp"] = 1000
+            a_visible = bot.combat(o, me)
+            self.assertGreater(a_visible["aim"][1], 0.08)
+            me["aim"] = a_visible["aim"]
+            a_visible_fire = bot.combat(o, me)
+            self.assertTrue(a_visible_fire["fire"][1])
 
             # Disabled flag: mortar does not fire
             B.FLAGS["mortar"] = False

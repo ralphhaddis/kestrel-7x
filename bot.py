@@ -1728,7 +1728,9 @@ class Bot:
                 best_mem = None
                 best_md = math.inf
                 for aid, (st_t, spos, svel) in self.seen.items():
-                    if aid >= 16 or (t_now - st_t) > 3.5:
+                    # Blind mortar fire is useful only while the last sighting is still
+                    # a reasonable estimate of the target's position.
+                    if aid >= 16 or (t_now - st_t) > 1.0:
                         continue
                     md = math.hypot(spos[0] - mx, spos[1] - my)
                     if 18.0 <= md <= 190.0 and md < best_md:
