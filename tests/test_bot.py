@@ -300,6 +300,170 @@ class Decisions(unittest.TestCase):
         finally:
             B.FLAGS["cover"] = old_cover
 
+    def test_los_fire_gate_keeps_aim_behind_wall(self):
+        o = make_obs(in_zone=True)
+        mx, my = 29.5, -87.0
+        mz = WORLD.ground_z(mx, my)
+        ex, ey = -29.2, -87.0
+        ez = WORLD.ground_z(ex, ey)
+        o["self"]["pos"] = [mx, my, mz]
+        o["self"]["aim"] = [math.pi, 0.0]
+        o["mechs"] = [enemy(8, (ex, ey, ez))]
+        muzzle_h = o["self"]["stats"]["muzzle_height"]
+        self.assertFalse(WORLD.has_los((mx, my, mz + muzzle_h), (ex, ey, ez + muzzle_h)))
+        self.bot.update_memory(o)
+        a = self.bot.combat(o, o["self"])
+        self.assertLess(abs(B.wrap(a["aim"][0] - math.pi)), 0.2)
+        self.assertEqual(a["fire"], [False, False])
+        # If laser already has charge > 0, hold charge rather than releasing into a wall
+        laser = {"kind": "laser", "cooldown": 0, "charge": 0.4,
+                 "stats": dict(HELLO["config"]["weapons"]["laser"])}
+        o["self"]["weapons"] = [o["self"]["weapons"][0], laser]
+        a2 = self.bot.combat(o, o["self"])
+        self.assertEqual(a2["fire"], [False, True])
+
+    def test_target_priority_los_and_low_hp(self):
+        o = make_obs(in_zone=True)
+        # Two enemies in clear LOS: 25m full HP (1400) vs 35m low HP (100)
+        mx, my, mz = o["self"]["pos"]
+        e_full = enemy(10, (mx + 25.0, my, WORLD.ground_z(mx + 25.0, my)))
+        e_low = enemy(11, (mx + 35.0, my, WORLD.ground_z(mx + 35.0, my)))
+        e_low["hp"] = 100
+        muzzle_h = o["self"]["stats"]["muzzle_height"]
+        self.assertTrue(WORLD.has_los((mx, my, mz + muzzle_h), (mx + 25.0, my, e_full["pos"][2] + 4.5)))
+        self.assertTrue(WORLD.has_los((mx, my, mz + muzzle_h), (mx + 35.0, my, e_low["pos"][2] + 4.5)))
+        o["mechs"] = [e_full, e_low]
+        self.bot.update_memory(o)
+        self.assertEqual(self.bot.pick_target(o, o["self"])["id"], 11)
+
+        # Enemy behind wall at ~40m (has_los == False) vs enemy in clear LOS at 58m (has_los == True)
+        mx2, my2 = 29.5, -74.0
+        mz2 = WORLD.ground_z(mx2, my2)
+        o["self"]["pos"] = [mx2, my2, mz2]
+        bx, by = -10.5, -90.0  # blocked by building prism 64 (-9.2..21.5 x -96..-78)
+        bz = WORLD.ground_z(bx, by)
+        cx, cy = -29.2, -74.0  # 58.7m west in clear LOS just north of prism 64
+        cz = WORLD.ground_z(cx, cy)
+        self.assertFalse(WORLD.has_los((mx2, my2, mz2 + muzzle_h), (bx, by, bz + 4.5)))
+        self.assertTrue(WORLD.has_los((mx2, my2, mz2 + muzzle_h), (cx, cy, cz + 4.5)))
+        o["mechs"] = [enemy(12, (bx, by, bz)), enemy(13, (cx, cy, cz))]
+        self.bot.update_memory(o)
+        self.assertEqual(self.bot.pick_target(o, o["self"])["id"], 13)
+
+    def test_heal_cover_ceasefire_and_break_rules(self):
+        old_heal = B.FLAGS.get("heal", True)
+        try:
+            B.FLAGS["heal"] = True
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=500, max_hp=1400)
+            o["t"] = 10.0
+            o["events"] = []
+            x, y, z = o["self"]["pos"]
+            o["self"]["aim"] = [0.0, 0.0]
+            o["mechs"] = [enemy(15, (x + 100.0, y, z))]
+            bot.update_memory(o)
+            a = bot.combat(o, o["self"])
+            self.assertEqual(a["fire"], [False, False])
+
+            # Close-range LOS threat (25m <= 35m) breaks ceasefire
+            o["mechs"] = [enemy(15, (x + 25.0, y, z))]
+            bot.update_memory(o)
+            a_close = bot.combat(o, o["self"])
+            self.assertTrue(a_close["fire"][0])
+
+            # Recovery to hp >= 0.85 * max_hp (1250 >= 1190) ends ceasefire at 100m
+            o["self"]["hp"] = 1250
+            o["mechs"] = [enemy(15, (x + 100.0, y, z))]
+            bot.update_memory(o)
+            a_healed = bot.combat(o, o["self"])
+            self.assertTrue(a_healed["fire"][0])
+
+            # Laser speed-trap guard: when charge == 0, do not start charging while healing
+            o["self"]["hp"] = 500
+            laser = {"kind": "laser", "cooldown": 0, "charge": 0,
+                     "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            o["self"]["weapons"] = [o["self"]["weapons"][0], laser]
+            bot.update_memory(o)
+            a_laser_guard = bot.combat(o, o["self"])
+            self.assertFalse(a_laser_guard["fire"][1])
+        finally:
+            B.FLAGS["heal"] = old_heal
+
+    def test_open_field_kiting_and_perimeter_settle(self):
+        old_kite = B.FLAGS.get("kite", True)
+        try:
+            B.FLAGS["kite"] = True
+            bot = B.Bot(copy.deepcopy(HELLO))
+            # Perimeter settle: next_radius=300, alive=10 -> settle = 0.60 * 300 = 180m; at d=165m holds still
+            o = make_obs(in_zone=True)
+            cx, cy = o["zone"]["next_center"]
+            o["zone"]["next_radius"] = 300.0
+            o["alive"] = 10
+            o["mechs"] = []
+            o["pods"] = []
+            o["cubes"] = []
+            o["events"] = []
+            px, py = cx + 165.0, cy
+            o["self"]["pos"] = [px, py, WORLD.ground_z(px, py)]
+            bot.update_memory(o)
+            a_settle = bot.movement(o, o["self"])
+            self.assertEqual(a_settle["move"], [0.0, 0.0])
+
+            # Open-field kiting: use open ground near spawn with no cover building blocking LOS to enemy 35m away
+            ox, oy, oz = OBS[0]["self"]["pos"]
+            ex, ey = ox + 35.0, oy
+            ez = WORLD.ground_z(ex, ey)
+            o2 = make_obs(in_zone=True)
+            o2["self"]["pos"] = [ox, oy, oz]
+            o2["zone"]["next_center"] = [ox, oy]
+            o2["zone"]["next_radius"] = 300.0
+            o2["pods"] = []
+            o2["cubes"] = []
+            o2["mechs"] = [enemy(20, (ex, ey, ez))]
+            bot.cover_goal = None
+            bot.update_memory(o2)
+            # Ensure no cover is available at this open location, or force choose_cover None if needed
+            if hasattr(bot, "choose_cover") and bot.choose_cover(o2, o2["self"], ox, oy, 240.0) is not None:
+                bot.choose_cover = lambda *args, **kwargs: None
+            a_kite = bot.movement(o2, o2["self"])
+            mx_v, my_v = a_kite["move"]
+            self.assertGreater(math.hypot(mx_v, my_v), 0.1)
+            # Dot product of move vector with vector to enemy (35, 0) must be < 0 (kiting away)
+            self.assertLess(mx_v * (ex - ox) + my_v * (ey - oy), 0.0)
+        finally:
+            B.FLAGS["kite"] = old_kite
+
+    def test_cube_pickup_and_near_sound_idle_aim(self):
+        old_cubes = B.FLAGS.get("cubes", True)
+        old_sound = B.FLAGS.get("sound", True)
+        old_heal = B.FLAGS.get("heal", True)
+        try:
+            B.FLAGS["cubes"] = True
+            B.FLAGS["sound"] = True
+            B.FLAGS["heal"] = True
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=500, max_hp=1400)
+            o["t"] = 20.0
+            sx, sy, sz = o["self"]["pos"]
+            o["zone"]["next_center"] = [sx, sy]
+            o["zone"]["next_radius"] = 300.0
+            o["mechs"] = []
+            o["pods"] = []
+            o["events"] = []
+            cx, cy = sx + 10.0, sy
+            cz = WORLD.ground_z(cx, cy)
+            o["cubes"] = [{"id": 99, "pos": [cx, cy, cz], "amount": 1}]
+            o["sounds"] = [{"kind": "gun", "bearing": 1.25, "dist": "near", "age": 0.05}]
+            bot.update_memory(o)
+            a_move = bot.movement(o, o["self"])
+            self.assertGreater(a_move["move"][0], 0.9)
+            a_combat = bot.combat(o, o["self"])
+            self.assertAlmostEqual(a_combat["aim"][0], 1.25, places=5)
+        finally:
+            B.FLAGS["cubes"] = old_cubes
+            B.FLAGS["sound"] = old_sound
+            B.FLAGS["heal"] = old_heal
+
 
 if __name__ == "__main__":
     unittest.main()

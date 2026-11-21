@@ -336,8 +336,7 @@ class WorldMap:
         if dist_3d <= 1e-4:
             return True
 
-        # Use fine sampling (at most 2.0 m spacing along the 3D ray) so thin walls are never skipped
-        eff_step = min(float(step), 2.0) if step > 0.0 else 2.0
+        eff_step = min(float(step), 3.0) if step > 0.0 else 3.0
         steps = max(2, int(math.ceil(dist_3d / eff_step)))
         inv = 1.0 / steps
         sx = dx * inv
@@ -351,11 +350,11 @@ class WorldMap:
             x += sx
             y += sy
             z += sz
-            if z < self.ground_z(x, y):
-                return False
-            bucket = grid.get((int(math.floor(x / cell)), int(math.floor(y / cell))))
+            bucket = grid.get((int(x // cell), int(y // cell)))
             if bucket:
                 for p in bucket:
                     if p["base"] <= z <= p["top"] and self._in_prism_xy(x, y, p):
                         return False
+            if z < self.ground_z(x, y):
+                return False
         return True
