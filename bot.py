@@ -1572,7 +1572,7 @@ class Bot:
                         # full and in range: hold until on target, then let go (auto-fires after hold_s anyway)
                         fire[i] = not is_aligned
 
-        if FLAGS.get("rear_guard", True) and not any(fire) and not has_los:
+        if FLAGS.get("rear_guard", True) and not any(fire) and not has_los and not mortar_primary:
             zone = obs["zone"]
             cx, cy = zone["next_center"]
             d_next = math.hypot(cx - mx, cy - my)
