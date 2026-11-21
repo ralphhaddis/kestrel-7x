@@ -112,6 +112,96 @@ class WorldMap:
         self.corner_nodes: List[Tuple[float, float]] = []
         self.corner_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
         self._build_corner_nodes()
+        self.canopy_nodes: List[Tuple[float, float]] = []
+        self.canopy_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        self._build_canopy_nodes(w)
+
+    def _build_canopy_nodes(self, w: Dict[str, Any]) -> None:
+        """Precompute walkable tree-canopy concealment positions (crownR >= 2.2 m) into a 16 m grid."""
+        t_obj = w.get("trees", {})
+        t_fields = t_obj.get("fields", ())
+        t_data = t_obj.get("data", ())
+        nf = len(t_fields)
+        if nf == 0 or not t_data:
+            return
+        f_idx = {name: i for i, name in enumerate(t_fields)}
+        if not all(k in f_idx for k in ("x", "y", "z", "height", "crownR", "crownBase", "trunkR")):
+            return
+        ix, iy, iz = f_idx["x"], f_idx["y"], f_idx["z"]
+        ih, icr, icb, itr = f_idx["height"], f_idx["crownR"], f_idx["crownBase"], f_idx["trunkR"]
+        icx = f_idx.get("crownX", ix)
+        icy = f_idx.get("crownY", iy)
+        cell = self.cell
+        nodes = self.canopy_nodes
+        cgrid = self.canopy_grid
+        seen_cells = set()
+        eye_h = self.eye_height
+        mech_r = self.mech_r
+
+        for k in range(0, len(t_data), nf):
+            cr = float(t_data[k + icr])
+            if cr < 2.2:
+                continue
+            tx = float(t_data[k + ix])
+            ty = float(t_data[k + iy])
+            tz = float(t_data[k + iz])
+            th = float(t_data[k + ih])
+            cb = float(t_data[k + icb])
+            tr = float(t_data[k + itr])
+            cx_t = float(t_data[k + icx])
+            cy_t = float(t_data[k + icy])
+            # Eye height at ground_z + eye_h must sit inside or near the crown vertical band [tz+cb, tz+th]
+            if not (tz + cb - 1.5 <= tz + eye_h <= tz + th + 1.0):
+                continue
+            # Tree trunks block vision only, not movement (kit/protocol.md): place at crown center (cx_t, cy_t)
+            # for maximum 360-deg canopy chord thickness (~5.0 m >= 3.96 m vision block threshold).
+            px = cx_t
+            py = cy_t
+            dkey = (int(math.floor(px / 6.0)), int(math.floor(py / 6.0)))
+            if dkey in seen_cells:
+                continue
+            gz = self.ground_z(px, py)
+            if not self.is_walkable(px, py, gz, _gz=gz):
+                continue
+            seen_cells.add(dkey)
+            pt = (px, py)
+            nodes.append(pt)
+            ckey = (int(math.floor(px / cell)), int(math.floor(py / cell)))
+            bucket = cgrid.get(ckey)
+            if bucket is None:
+                cgrid[ckey] = [pt]
+            else:
+                bucket.append(pt)
+
+    def nearby_canopies(
+        self,
+        x: float,
+        y: float,
+        max_r: float = 28.0,
+        limit: int = 8,
+    ) -> List[Tuple[float, float]]:
+        """Return up to `limit` precomputed tree-canopy concealment positions within max_r m."""
+        cell = self.cell
+        gx0 = int(math.floor((x - max_r) / cell))
+        gy0 = int(math.floor((y - max_r) / cell))
+        gx1 = int(math.floor((x + max_r) / cell))
+        gy1 = int(math.floor((y + max_r) / cell))
+        max_r2 = max_r * max_r
+        cgrid = self.canopy_grid
+        found: List[Tuple[float, float, float]] = []
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                bucket = cgrid.get((gx, gy))
+                if not bucket:
+                    continue
+                for px, py in bucket:
+                    dx = px - x
+                    dy = py - y
+                    d2 = dx * dx + dy * dy
+                    if d2 <= max_r2:
+                        found.append((d2, px, py))
+        found.sort(key=lambda item: item[0])
+        return [(px, py) for _, px, py in found[:limit]]
 
     def _build_corner_nodes(self) -> None:
         """Precompute walkable exterior building corners offset by mech_r + 1.5 m into a 16 m grid."""

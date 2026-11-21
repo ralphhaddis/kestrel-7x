@@ -2196,6 +2196,51 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_w7_squad_survival_canopy_stealth_and_multicube_crates(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w7_squad_survival=True, farm_crate=True, rear_guard=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            self.assertGreater(len(bot.world.canopy_nodes), 50, "WorldMap should index walkable tree canopy nodes")
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, cubes=2)
+            o["t"] = 25.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["events"] = []
+            # 1. With cubes=2 and a full weapon loadout (gun + laser), w7_squad_survival still farms safe ground crates (<4 cubes, t<90s)
+            l_st = dict(HELLO["config"]["weapons"]["laser"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": l_st},
+            ]
+            cx_c, cy_c = x + 18.0, y
+            cz_c = WORLD.ground_z(cx_c, cy_c)
+            o["crates"] = [{"id": 3001, "pos": [cx_c, cy_c, cz_c], "hp": 300}]
+            bot.update_memory(o)
+            am = bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.crate_target)
+            self.assertEqual(bot.crate_target["id"], 3001)
+            self.assertGreater(am["move"][0], 0.5)
+
+            # 2. Mid-range combat sound updates rear_guard_yaw and triggers tree-canopy stealth settle when no crates/enemies visible
+            o["crates"] = []
+            cnx, cny = bot.world.canopy_nodes[0]
+            cnz = WORLD.ground_z(cnx, cny)
+            o["self"]["pos"] = [cnx - 8.0, cny, cnz]
+            o["zone"].update(center=[cnx, cny], radius=400.0, next_center=[cnx, cny], next_radius=200.0)
+            o["sounds"] = [{"kind": "laser", "dist": "mid", "bearing": 1.25}]
+            bot.update_memory(o)
+            self.assertIsNotNone(bot.last_near_sound)
+            self.assertAlmostEqual(bot.last_near_sound[1], 1.25, places=3)
+            am2 = bot.movement(o, o["self"])
+            self.assertGreater(math.hypot(*am2["move"]), 0.5, "Should step into nearby tree canopy when mid combat sound is heard")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()

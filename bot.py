@@ -50,6 +50,7 @@ FLAGS = {
     "w6_crossfire_escape": True, # W6-1: radial 48m cover fallback + boosted pinch escape + anti-rusher backpedal + NPC-fire dodge
     "w6_loot_hunt": True,     # W6-2: safe 62m lightning & 85m unboosted laser detour when slot 1 is empty and zero enemies visible
     "w6_endgame_mastery": True, # W6-3: energy reserve & tight center control in final circles (next_radius <= 35m)
+    "w7_squad_survival": True, # W7-1: tree-canopy stealth settle + proactive charging-laser cover + mid-sound pre-aim + multi-cube crate farming
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -262,19 +263,21 @@ class Bot:
                 self.last_sound = (t, best_bearing)
 
         if FLAGS.get("rear_guard", True):
+            w7_sq = FLAGS.get("w7_squad_survival", True)
             best_prio = 0
             best_bearing = None
             for s in obs.get("sounds", ()):
-                if s.get("dist") != "near":
+                d_s = s.get("dist")
+                if d_s != "near" and not (w7_sq and d_s == "mid"):
                     continue
                 b = s.get("bearing")
                 if b is None:
                     continue
                 k = s.get("kind")
                 if k in ("gun", "laser", "laser_charge", "lightning", "mortar", "explosion"):
-                    prio = 3
+                    prio = 3 if d_s == "near" else 1
                 elif k in ("boost", "jet", "step"):
-                    prio = 2
+                    prio = 2 if d_s == "near" else 0
                 else:
                     prio = 0
                 if prio > best_prio:
@@ -628,6 +631,9 @@ class Bot:
             enemy_charging = any(m.get("charging") for m in obs["mechs"] if m.get("kind") == "mech")
             vis_enemies = [m for m in obs["mechs"] if m.get("kind") == "mech"]
             proactive = self.healing or reloading or enemy_charging or len(vis_enemies) >= 2
+        elif FLAGS.get("w7_squad_survival", True):
+            vis_enemies = [m for m in obs["mechs"] if m.get("kind") == "mech"]
+            proactive = len(vis_enemies) >= 2 and me["hp"] < 0.85 * me["max_hp"]
 
         if not (recent_hit or pursuing or proactive):
             self.cover_goal = None
@@ -1133,8 +1139,13 @@ class Bot:
             return None
         t = obs["t"]
         cubes = me.get("cubes", 0)
-        if not (cubes == 0 or (None in me["weapons"] and cubes < 2 and t < 90.0)):
-            return None
+        w7_sq = FLAGS.get("w7_squad_survival", True)
+        if w7_sq:
+            if not (cubes == 0 or (cubes < 4 and t < 90.0)):
+                return None
+        else:
+            if not (cubes == 0 or (None in me["weapons"] and cubes < 2 and t < 90.0)):
+                return None
         if any(m.get("kind") == "mech" for m in obs["mechs"]):
             return None
         if any(aid < 16 for aid in self.seen):
@@ -1547,6 +1558,26 @@ class Bot:
                             goal = (cx, cy)
                         elif d > settle:
                             goal = (cx, cy)
+                        elif (FLAGS.get("w7_squad_survival", True)
+                              and self.world is not None
+                              and hasattr(self.world, "nearby_canopies")
+                              and not any(m.get("kind") == "mech" for m in obs["mechs"])
+                              and (any(aid < 16 for aid in self.seen)
+                                   or (self.last_near_sound is not None and t - self.last_near_sound[0] <= 2.5))
+                              and (self.threat is None or t - self.threat[0] >= THREAT_MEMORY_S)):
+                            mr_c, mh_c = me["stats"].get("radius"), me["stats"].get("height")
+                            mz_c = me["pos"][2]
+                            for cnx, cny in self.world.nearby_canopies(x, y, max_r=22.0, limit=4):
+                                if math.hypot(cnx - cx, cny - cy) <= settle:
+                                    cnz = self.world.ground_z(cnx, cny)
+                                    if abs(mz_c - cnz) > 2.5:
+                                        continue
+                                    dc_can = math.hypot(cnx - x, cny - y)
+                                    if dc_can <= 2.2:
+                                        break
+                                    if self.world.path_clear(me["pos"], (cnx, cny, cnz), radius=mr_c, height=mh_c):
+                                        goal = (cnx, cny)
+                                        break
 
         if goal is None:  # hold still: silent, and the gun is steadier
             self.move_yaw = None
@@ -1937,12 +1968,20 @@ class Bot:
                 direct = self.aim_at(src, cp, (0.0, 0.0, 0.0), None, me, clamp=False)
                 aim = [direct[0], min(max(direct[1], me["stats"]["min_pitch"]), me["stats"]["max_pitch"])]
                 actual = me["aim"]
+                w7_sq = FLAGS.get("w7_squad_survival", True)
                 if (self.world is None or self.world.has_los(src, cp)):
                     for i, w in enumerate(weapons):
-                        if w and w["kind"] == "gun":
+                        if not w:
+                            continue
+                        if w["kind"] == "gun":
                             fire[i] = (w.get("ammo", 0) > 0 and w.get("reload", 0) == 0
                                        and dist <= w["stats"]["range"]
                                        and self.aligned(actual, direct, dist, self.crate_r, self.crate_h * 0.5))
+                        elif w7_sq and w["kind"] == "lightning":
+                            cost_c = w["stats"].get("energy", 3)
+                            fire[i] = (w["cooldown"] <= cd_fast and dist <= w["stats"]["range"] * 0.95
+                                       and me["energy"] >= cost_c + ENERGY_RESERVE
+                                       and abs(wrap(actual[0] - direct[0])) <= math.radians(w["stats"]["cone_deg"]) * 0.4)
                 self.draw(me, cp, f"crate {self.crate_target['id']} {dist:.0f}m")
                 return {"aim": aim, "fire": fire}
 
