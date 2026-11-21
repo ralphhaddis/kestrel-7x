@@ -247,11 +247,28 @@ class Bot:
         if not threats:
             self.cover_goal = None
             return None
-
         t = obs["t"]
+        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+        reloading = gun is not None and gun.get("reload", 0) > 0
+        enemy_charging = any(m.get("charging") for m in obs["mechs"])
+        recently_hit = self.threat is not None and (t - self.threat[0]) <= THREAT_MEMORY_S
+        need_cover = (
+            self.healing
+            or me["hp"] < 0.85 * me["max_hp"]
+            or len(threats) >= 2
+            or recently_hit
+            or reloading
+            or enemy_charging
+        )
+        if not need_cover:
+            self.cover_goal = None
+            return None
         st = me["stats"]
         eye_h = st.get("eye_height", 8.0)
         mr, mh = st.get("radius"), st.get("height")
+        cur_eye = (x, y, z + eye_h)
+        cur_exposed = sum(1 for t_eye in threats if self.world.has_los(cur_eye, t_eye))
+
         if t < self.cover_until:
             if self.cover_goal is None:
                 return None
@@ -259,11 +276,17 @@ class Bot:
             if math.hypot(gx - cx, gy - cy) <= inner:
                 gz = self.world.ground_z(gx, gy)
                 goal_eye = (gx, gy, gz + eye_h)
-                if any(not self.world.has_los(goal_eye, t_eye) for t_eye in threats) and self.world.path_clear(me["pos"], (gx, gy, gz), radius=mr, height=mh):
+                if all(not self.world.has_los(goal_eye, t_eye) for t_eye in threats) and self.world.path_clear(me["pos"], (gx, gy, gz), radius=mr, height=mh):
                     return self.cover_goal
 
+        if cur_exposed == 0 and math.hypot(cx - x, cy - y) <= inner:
+            self.cover_goal = (x, y)
+            self.cover_until = t + COVER_HOLD_S
+            return self.cover_goal
+
+        nearest_t = min(threats, key=lambda te: math.hypot(te[0] - x, te[1] - y))
         base_angle = math.atan2(cy - y, cx - x)
-        candidates: List[Tuple[float, float]] = [(x, y)]
+        candidates: List[Tuple[float, float]] = []
         for r in (15.0, 30.0, 45.0):
             for k in range(10):
                 ang = base_angle + TAU * k / 10.0
@@ -277,16 +300,19 @@ class Bot:
                 continue
             pz = self.world.ground_z(px, py)
             cand_eye = (px, py, pz + eye_h)
-            hidden = sum(1 for t_eye in threats if not self.world.has_los(cand_eye, t_eye))
-            if hidden == 0:
+            if self.world.has_los(cand_eye, nearest_t):
                 continue
+            exposed = sum(1 for t_eye in threats if self.world.has_los(cand_eye, t_eye))
+            if exposed >= cur_exposed:
+                continue
+            hidden = len(threats) - exposed
             travel = math.hypot(px - x, py - y)
             score = hidden * 100.0 - travel * 1.0 - d_center * 0.25
             if score <= best_score:
                 continue
             if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
                 continue
-            if (px != x or py != y) and not self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh):
+            if not self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh):
                 continue
             best_score = score
             best_pos = (px, py)
@@ -310,42 +336,33 @@ class Bot:
 
         nt = min(exposed_threats, key=lambda te: math.hypot(te[0] - x, te[1] - y))
         td = math.hypot(nt[0] - x, nt[1] - y)
+        if not (td < 55.0 or len(exposed_threats) >= 2 or self.healing):
+            return None, td
         tb = math.atan2(nt[1] - y, nt[0] - x)
         step_r = 16.0
+        cur_dc = math.hypot(x - cx, y - cy)
+        max_dc = max(cur_dc, inner * 0.75)
 
-        if td < 60.0 or len(exposed_threats) >= 2 or self.healing:
-            away = tb + math.pi
-            angles = [away, away + 0.5, away - 0.5, away + 1.0, away - 1.0, away + 1.5, away - 1.5]
-            best_pt: Optional[Tuple[float, float]] = None
-            best_score = -math.inf
-            for idx, ang in enumerate(angles):
-                kx, ky = x + step_r * math.cos(ang), y + step_r * math.sin(ang)
-                d_center = math.hypot(kx - cx, ky - cy)
-                if inner > 3.0 and d_center > inner:
-                    continue
-                kz = self.world.ground_z(kx, ky)
-                if not self.world.is_walkable(kx, ky, kz, radius=mr, height=mh):
-                    continue
-                if not self.world.path_clear(me["pos"], (kx, ky, kz), radius=mr, height=mh):
-                    continue
-                d_threat = math.hypot(kx - nt[0], ky - nt[1])
-                score = d_threat - 0.25 * d_center - 1.5 * idx
-                if score > best_score:
-                    best_score = score
-                    best_pt = (kx, ky)
-            return best_pt, td
-        else:
-            side = 1 if int(obs["t"] / 1.4) % 2 == 0 else -1
-            strafe = tb + side * (math.pi * 0.55)
-            angles = [strafe, tb - side * (math.pi * 0.55), tb + math.pi]
-            for ang in angles:
-                kx, ky = x + step_r * math.cos(ang), y + step_r * math.sin(ang)
-                if inner > 3.0 and math.hypot(kx - cx, ky - cy) > inner:
-                    continue
-                kz = self.world.ground_z(kx, ky)
-                if self.world.is_walkable(kx, ky, kz, radius=mr, height=mh) and self.world.path_clear(me["pos"], (kx, ky, kz), radius=mr, height=mh):
-                    return (kx, ky), td
-            return None, td
+        away = tb + math.pi
+        angles = [away, away + 0.5, away - 0.5, away + 1.0, away - 1.0, away + 1.5, away - 1.5]
+        best_pt: Optional[Tuple[float, float]] = None
+        best_score = -math.inf
+        for idx, ang in enumerate(angles):
+            kx, ky = x + step_r * math.cos(ang), y + step_r * math.sin(ang)
+            d_center = math.hypot(kx - cx, ky - cy)
+            if inner > 3.0 and d_center > max_dc:
+                continue
+            kz = self.world.ground_z(kx, ky)
+            if not self.world.is_walkable(kx, ky, kz, radius=mr, height=mh):
+                continue
+            if not self.world.path_clear(me["pos"], (kx, ky, kz), radius=mr, height=mh):
+                continue
+            d_threat = math.hypot(kx - nt[0], ky - nt[1])
+            score = d_threat - 0.45 * d_center - 1.5 * idx
+            if score > best_score:
+                best_score = score
+                best_pt = (kx, ky)
+        return best_pt, td
 
     def movement(self, obs: mf.Observation, me) -> dict:
         x, y = me["pos"][0], me["pos"][1]
@@ -372,6 +389,8 @@ class Bot:
                     goal = None
                 else:
                     goal = cover
+                    if (self.healing or (t - self.last_damaged_t) <= 1.0) and me["energy"] > 25.0:
+                        kite_boost = True
             else:
                 kite_goal, kite_td = self.choose_kite(obs, me, cx, cy, inner)
                 if kite_goal is not None:
