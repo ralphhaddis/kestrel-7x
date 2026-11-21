@@ -1613,6 +1613,256 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_cover_boost_sprints_when_exposed_or_low_hp(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["cover_boost"] = True
+        B.FLAGS["cover"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, energy=60.0, hp=1400.0, max_hp=1400.0)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(next_center=[mx, my], next_radius=200.0)
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = [{"type": "damaged", "amount": 25, "weapon": "gun",
+                            "bearing": math.atan2(ey - my, ex - mx), "by": 7}]
+            bot.update_memory(o)
+            a1 = bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.cover_goal)
+            self.assertTrue(bot.cover_exposed)
+            self.assertTrue(a1["boost"])
+
+            # Energy <= ENERGY_RESERVE: does not cover_boost
+            o["self"]["energy"] = B.ENERGY_RESERVE
+            a_low_e = bot.movement(o, o["self"])
+            self.assertFalse(a_low_e["boost"])
+
+            # Already unexposed while moving to cover: only boosts if hp < 50% and recent hit
+            o["self"]["energy"] = 60.0
+            bot.choose_cover = lambda *args, **kwargs: (mx + 10.0, my)
+            bot.cover_exposed = False
+            o["self"]["hp"] = 1000.0
+            self.assertFalse(bot.movement(o, o["self"])["boost"])
+            o["self"]["hp"] = 500.0
+            self.assertTrue(bot.movement(o, o["self"])["boost"])
+
+            # Flag disabled: no cover_boost
+            B.FLAGS["cover_boost"] = False
+            bot.cover_exposed = True
+            self.assertFalse(bot.movement(o, o["self"])["boost"])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_crossfire_cover_triggers_on_two_mechs_and_allows_partial_cover(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["crossfire_cover"] = True
+        B.FLAGS["cover"] = True
+        try:
+            # 1. Verify WORLD.corner_nodes are all adjacent to prisms with top >= gz + 9.5
+            self.assertGreater(len(WORLD.corner_nodes), 10)
+            for px, py in WORLD.corner_nodes[::max(1, len(WORLD.corner_nodes) // 40)]:
+                gz = WORLD.ground_z(px, py)
+                gx0 = int(math.floor((px - 8.0) / WORLD.cell))
+                gy0 = int(math.floor((py - 8.0) / WORLD.cell))
+                gx1 = int(math.floor((px + 8.0) / WORLD.cell))
+                gy1 = int(math.floor((py + 8.0) / WORLD.cell))
+                has_tall = False
+                for gx in range(gx0, gx1 + 1):
+                    for gy in range(gy0, gy1 + 1):
+                        for p in WORLD.grid.get((gx, gy), ()):
+                            if p["kind"] != "bridge" and p["top"] >= gz + 9.5:
+                                has_tall = True
+                                break
+                        if has_tall:
+                            break
+                    if has_tall:
+                        break
+                self.assertTrue(has_tall, f"Corner ({px:.1f}, {py:.1f}) lacks >=9.5m prism")
+
+            # 2. Crossfire trigger: 2 exposed mechs within 115m without any damaged event
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(next_center=[mx, my], next_radius=200.0)
+            e1x, e1y = -29.2, -74.0   # ~59m west, can be hidden behind prism 64
+            e2x, e2y = 45.0, -74.0    # ~15.5m east, clear LOS on opposite side
+            e1 = enemy(7, (e1x, e1y, WORLD.ground_z(e1x, e1y)))
+            e2 = enemy(8, (e2x, e2y, WORLD.ground_z(e2x, e2y)))
+            o["mechs"] = [e1, e2]
+            o["events"] = []
+            bot.update_memory(o)
+            goal = bot.choose_cover(o, o["self"], mx, my, 160.0)
+            self.assertIsNotNone(goal)
+
+            # Finishable enemy (<220 HP) suppresses crossfire trigger
+            bot2 = B.Bot(copy.deepcopy(HELLO))
+            o_fin = copy.deepcopy(o)
+            o_fin["mechs"][0]["hp"] = 200.0
+            bot2.update_memory(o_fin)
+            self.assertIsNone(bot2.choose_cover(o_fin, o_fin["self"], mx, my, 160.0))
+
+            # 3. Priority-threat hysteresis: if closest priority threat gains LOS to cover_goal,
+            # hysteresis breaks even if a distant non-priority threat is still hidden
+            gx, gy = goal
+            gz = WORLD.support_z(gx, gy, mz)
+            eye_h = o["self"]["stats"]["eye_height"]
+            e_close = enemy(9, (gx + 5.0, gy, WORLD.ground_z(gx + 5.0, gy)))
+            o_hyst = copy.deepcopy(o)
+            o_hyst["t"] += 0.1
+            o_hyst["mechs"] = [e_close]
+            o_hyst["events"] = []
+            bot.seen = {7: (o_hyst["t"], e1["pos"], [0, 0, 0])}
+            bot.update_memory(o_hyst)
+            bot.cover_until = o_hyst["t"] + 5.0
+            if WORLD.has_los((gx, gy, gz + eye_h), (e_close["pos"][0], e_close["pos"][1], e_close["pos"][2] + 8.0)):
+                # Only 1 visible mech & no hit -> proactive=False; hysteresis must break -> returns None
+                self.assertIsNone(bot.choose_cover(o_hyst, o_hyst["self"], mx, my, 160.0))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_corner_settle_moves_to_corner_and_holds(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["corner_settle"] = True
+        B.FLAGS["kite"] = False
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            # Place zone center 15m away so 3.0 < d <= settle (0.5 * 200 = 100)
+            o["zone"].update(next_center=[mx + 15.0, my], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+            bot.update_memory(o)
+            a1 = bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.settle_corner)
+            self.assertGreater(math.hypot(*a1["move"]), 0.5)
+
+            # Once at settle_corner (within 2.5m), holds still
+            scx, scy = bot.settle_corner
+            o["self"]["pos"] = [scx, scy, WORLD.ground_z(scx, scy)]
+            a2 = bot.movement(o, o["self"])
+            self.assertEqual(a2["move"], [0.0, 0.0])
+
+            # With corner_settle disabled, holds still in open ground inside settle radius
+            B.FLAGS["corner_settle"] = False
+            bot2 = B.Bot(copy.deepcopy(HELLO))
+            o["self"]["pos"] = [mx, my, mz]
+            bot2.update_memory(o)
+            self.assertEqual(bot2.movement(o, o["self"])["move"], [0.0, 0.0])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_reload_cover_dip_and_early_peek(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["reload_cover"] = True
+        B.FLAGS["cover"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(next_center=[mx, my], next_radius=200.0)
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = []
+            o["self"]["weapons"][0]["reload"] = 1.2
+            o["self"]["weapons"][1] = None
+            bot.update_memory(o)
+            goal = bot.choose_cover(o, o["self"], mx, my, 160.0)
+            self.assertIsNotNone(goal)
+            self.assertEqual(bot.cover_reason, "reload")
+            self.assertLessEqual(math.hypot(goal[0] - mx, goal[1] - my), 18.0 + 1e-6)
+
+            # Early peek: when reload <= 0.35s, clears reload cover_goal
+            o["t"] += 0.85
+            o["self"]["weapons"][0]["reload"] = 0.3
+            bot.update_memory(o)
+            self.assertIsNone(bot.choose_cover(o, o["self"], mx, my, 160.0))
+            self.assertIsNone(bot.cover_goal)
+            self.assertIsNone(bot.cover_reason)
+
+            # Ready secondary suppresses reload dip
+            o["self"]["weapons"][0]["reload"] = 1.2
+            o["self"]["weapons"][1] = {"kind": "laser", "cooldown": 0.0, "charge": 0.0,
+                                       "stats": dict(HELLO["config"]["weapons"]["laser"])}
+            bot.update_memory(o)
+            self.assertIsNone(bot.choose_cover(o, o["self"], mx, my, 160.0))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_occluded_early_reload_and_rear_hit_guard(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["reload_cover"] = True
+        B.FLAGS["rear_guard"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            o["t"] = 20.0
+            # 1. Occluded early reload when ammo <= 4 and no LOS
+            mx, my = 29.5, -87.0
+            mz = WORLD.ground_z(mx, my)
+            ex, ey = -29.2, -87.0
+            ez = WORLD.ground_z(ex, ey)
+            o["self"]["pos"] = [mx, my, mz]
+            o["self"]["weapons"][0]["ammo"] = 4
+            o["self"]["weapons"][0]["reload"] = 0.0
+            o["self"]["weapons"][1] = None
+            o["mechs"] = [enemy(8, (ex, ey, ez))]
+            bot.update_memory(o)
+            a_occ = bot.combat(o, o["self"])
+            self.assertTrue(a_occ.get("reload", False))
+
+            # Ammo == 5 does not trigger early reload
+            o["self"]["weapons"][0]["ammo"] = 5
+            self.assertFalse(bot.combat(o, o["self"]).get("reload", False))
+
+            # 2. Rear-hit guard turns to threat bearing even with LOS to another enemy
+            o2 = make_obs(in_zone=True)
+            o2["t"] = 25.0
+            x, y, z = o2["self"]["pos"]
+            o2["self"]["aim"] = [0.5, 0.0]  # not aligned so fire=[False, False]
+            o2["self"]["weapons"][0]["ammo"] = 10
+            o2["self"]["weapons"][0]["reload"] = 0.0
+            o2["self"]["weapons"][1] = None
+            o2["mechs"] = [enemy(5, (x + 50.0, y, z))]
+            o2["events"] = [{"type": "damaged", "amount": 30, "weapon": "gun",
+                             "bearing": -2.2, "by": 9, "rear": True}]
+            bot.world = None
+            bot.update_memory(o2)
+            a_rear = bot.combat(o2, o2["self"])
+            self.assertEqual(a_rear["fire"], [False, False])
+            self.assertAlmostEqual(a_rear["aim"][0], -2.2, places=5)
+
+            # 3. Reloading without ready secondary turns to rear_guard_yaw even with LOS
+            o2["t"] = 30.0
+            o2["events"] = []
+            o2["self"]["weapons"][0]["reload"] = 0.8
+            bot.threat = (o2["t"] - 0.2, 1.8)
+            bot.update_memory(o2)
+            a_rel = bot.combat(o2, o2["self"])
+            self.assertEqual(a_rel["fire"], [False, False])
+            self.assertAlmostEqual(a_rel["aim"][0], 1.8, places=5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()

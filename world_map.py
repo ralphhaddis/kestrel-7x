@@ -165,7 +165,7 @@ class WorldMap:
                 if dkey in seen_cells:
                     continue
                 gz = self.ground_z(px, py)
-                if top < gz + 6.0:
+                if top < gz + 9.5:
                     continue
                 if not self.is_walkable(px, py, gz, _gz=gz):
                     continue
