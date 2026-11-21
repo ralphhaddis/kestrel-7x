@@ -16,21 +16,27 @@ from typing import List, Optional, Tuple
 import mechfight as mf
 import world_map as wm
 
+# IMPORTANT BENCHMARKING NOTE FOR ALL AGENTS:
+# Always run tools/sim.py with 1 copy of Kestrel:
+#     python3 tools/sim.py --matches 48 --bots bot:Bot=1,aggro=5,runner=5,example=5
+# Running with bot:Bot=4 spawns 4 adjacent copies of Kestrel with 85%+ gun accuracy that kill each
+# other at spawn, creating a false "4-copy truce bias" that rewards passive/ceasefire flags which
+# lose badly (-1.04 pts) on the official 1v15 server.
 FLAGS = {
     "loot": True,             # detour to and take weapon pickups (kinds in LOOT_PREF)
     "fight": True,            # aim at and shoot enemies
     "lead": True,             # lead moving targets by projectile flight time (gun)
     "cover": True,            # seek cover when inside the zone and threatened
     "los_gate": True,         # gate fire[i] on world.has_los(src, tp)
-    "heal": True,             # HEAL_COVER ceasefire when low HP
-    # KEEP kite=False: enabling kite overrides reachable weapon pickups (loot_goal) when an enemy is
-    # within 85 m at full HP, widens early settle radius (50% -> 60%), and costs ~1.94 pts in ablation.
-    "kite": False,            # perimeter settle + open-field kiting (disabled: see movement() notes)
     "cubes": True,            # 20 m cube-seeking
-    "sound": True,            # face recent "near" sounds in idle_aim
-    "proactive_cover": True,  # seek cover proactively (healing, outnumbered, charging laser, reloading)
-    "combat_strafe": True,    # juking combat strafe + weapon spacing + laser dodge when exposed
-    "selective_fire": True,   # avoid initiating unprovoked distant poke fights
+    # Keep the flags below False (verified in 48-match 1-copy bot:Bot=1 ablations against e39d414 = 9.25):
+    "early_weapon": False,    # 210 m pickup detour (-1.15 pts in 1-copy sim: exposed long-range walks without A*)
+    "heal": False,            # HEAL_COVER ceasefire (-0.44 pts in 1-copy sim)
+    "kite": False,            # open-field kite / 0.60 settle (-1.94 pts; overrides loot_goal)
+    "sound": False,           # face recent "near" sounds in idle_aim (0.00 delta)
+    "proactive_cover": False, # seek cover on reload/multi-enemy (-0.31 pts in 1-copy sim)
+    "combat_strafe": False,   # continuous open-field strafe (-0.48 pts in 1-copy sim)
+    "selective_fire": False,  # hold unprovoked fire >58m (-0.23 pts in 1-copy sim; 4-copy truce artifact)
     "debug": True,            # attach debug drawings (never affects the match)
 }
 
@@ -75,6 +81,8 @@ class Bot:
 
         self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
+        self.seen_pickups = {}  # pickup id -> (t, pickup_dict)
+        self.bad_pickups = {}   # pickup id -> t_expire blacklist
         self.aggressors = {}    # attacker id -> t it last damaged us
         self.threat = None      # (t, bearing) of the last non-zone damage
         self.threat_id = None
@@ -88,6 +96,8 @@ class Bot:
         self.last_t = None
         self.dt = 0.1
         self.loot_goal = None   # (x, y) of a pickup to walk to, set by choose_take
+        self.loot_goal_id = None
+        self.progress_anchor: Optional[Tuple[float, float, float, float]] = None
         self.cover_goal: Optional[Tuple[float, float]] = None
         self.cover_until = -1.0
         self.move_yaw = None    # yaw we are walking along, None when holding still
@@ -134,9 +144,31 @@ class Bot:
                     self.threat_id = None
                 self.cover_goal = None
                 self.cover_threats = []
+            elif e.get("type") == "took":
+                self.seen_pickups.pop(e.get("id"), None)
+            elif e.get("type") == "take_failed":
+                pid = e.get("id")
+                self.seen_pickups.pop(pid, None)
+                if pid is not None:
+                    self.bad_pickups[pid] = t + 15.0
         cutoff = t - self.memory_s
         self.seen = {k: v for k, v in self.seen.items() if v[0] >= cutoff}
         self.aggressors = {k: v for k, v in self.aggressors.items() if v >= t - AGGRO_MEMORY_S}
+        self.bad_pickups = {k: v for k, v in self.bad_pickups.items() if v > t}
+
+        if FLAGS.get("early_weapon", False):
+            vis_ids = set()
+            for p in obs.get("pickups", ()):
+                pid = p["id"]
+                vis_ids.add(pid)
+                self.seen_pickups[pid] = (t, p)
+            mx, my, mz = obs["self"]["pos"]
+            for pid, (pt, p) in list(self.seen_pickups.items()):
+                if t - pt > 20.0:
+                    del self.seen_pickups[pid]
+                elif pid not in vis_ids and math.hypot(p["pos"][0] - mx, p["pos"][1] - my) <= 35.0:
+                    if self.world is None or self.world.has_los((mx, my, mz + 8.0), (p["pos"][0], p["pos"][1], p["pos"][2] + 1.0)):
+                        del self.seen_pickups[pid]
 
         me = obs["self"]
         if not FLAGS.get("heal", False) or not me["in_zone"]:
@@ -182,6 +214,7 @@ class Bot:
     def choose_take(self, obs: mf.Observation, me) -> dict:
         """Pick a pickup to walk to (self.loot_goal) and `take` it once in reach. Empty slot only."""
         self.loot_goal = None
+        self.loot_goal_id = None
         if not FLAGS.get("loot") or None not in me["weapons"]:
             return {}
         held = {w["kind"] for w in me["weapons"] if w}
@@ -189,21 +222,55 @@ class Bot:
         zone = obs["zone"]
         cx, cy = zone["next_center"]
         inner = zone["next_radius"] * 0.8
-        best, best_d = None, LOOT_DETOUR_M
-        for p in obs["pickups"]:
+        early_w = FLAGS.get("early_weapon", False)
+        max_detour = 210.0 if early_w else LOOT_DETOUR_M
+        walk_spd = max(1.0, me["stats"].get("walk_speed", 11.7))
+        time_avail = max(0.0, zone["shrink_end"] - obs["t"])
+
+        candidates = list(obs["pickups"])
+        if early_w:
+            vis_ids = {p["id"] for p in candidates}
+            for pid, (_, p) in self.seen_pickups.items():
+                if pid not in vis_ids:
+                    candidates.append(p)
+
+        best, best_score, best_d = None, max_detour, math.inf
+        for p in candidates:
+            pid = p["id"]
+            if pid in self.bad_pickups:
+                continue
             if p["kind"] not in LOOT_PREF or p["kind"] in held:
                 continue
-            if abs(p["pos"][2] - z) > 4.0:  # take works within 4 m vertically; roofs need map awareness
-                continue
-            if math.dist((x, y), p["pos"][:2]) > self.reach and math.hypot(p["pos"][0] - cx, p["pos"][1] - cy) > inner:  # don't pull back out of the next circle
-                continue
-            d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
-            if d < best_d:
-                best, best_d = p, d
+            px, py, pz = p["pos"][0], p["pos"][1], p["pos"][2]
+            d = math.hypot(px - x, py - y)
+            if d <= self.reach:
+                if abs(pz - z) > 4.0:
+                    continue
+            else:
+                if early_w and self.world is not None:
+                    # Check pickup height against its own local terrain floor (fixes hill rejection bug)
+                    if abs(pz - self.world.ground_z(px, py)) > 2.5:
+                        continue
+                elif abs(pz - z) > 4.0:
+                    continue
+                d_center = math.hypot(px - cx, py - cy)
+                if d_center > inner:
+                    if not early_w:
+                        continue
+                    d_back = d_center - inner
+                    if not me["in_zone"] or d_center > zone["radius"] * 0.90 or ((d + d_back) / walk_spd) > 0.65 * time_avail:
+                        continue
+                elif early_w and time_avail > 0 and (d / walk_spd) > 0.80 * time_avail and math.hypot(x - cx, y - cy) > inner:
+                    continue
+
+            score = d * (0.92 if (early_w and p["kind"] == "laser") else 1.0)
+            if score < best_score:
+                best, best_score, best_d = p, score, d
         if best is None:
             return {}
         self.loot_goal = (best["pos"][0], best["pos"][1])
-        return {"take": best["id"]} if best_d <= self.reach else {}
+        self.loot_goal_id = best["id"]
+        return {"take": best["id"]} if best_d <= self.reach and abs(best["pos"][2] - z) <= 4.0 else {}
 
     # ------------------------------------------------------------------ cover & movement
     def known_threats(self, obs: mf.Observation, me) -> List[Tuple[float, float, float]]:
@@ -510,7 +577,22 @@ class Bot:
             self.move_yaw = None
             self.stuck_s = 0.0
             self.unstick_until = -1.0
+            self.progress_anchor = None
             return {"move": [0.0, 0.0], "boost": False, "jump": False}
+
+        if FLAGS.get("early_weapon", False) and self.loot_goal is not None and goal == self.loot_goal:
+            goal_d = math.hypot(goal[0] - x, goal[1] - y)
+            if self.progress_anchor is None:
+                self.progress_anchor = (t, x, y, goal_d)
+            elif t - self.progress_anchor[0] >= 2.2:
+                net_disp = math.hypot(x - self.progress_anchor[1], y - self.progress_anchor[2])
+                goal_prog = self.progress_anchor[3] - goal_d
+                if net_disp < 3.0 and goal_prog < 2.0 and goal_d > 4.5 and self.loot_goal_id is not None:
+                    self.bad_pickups[self.loot_goal_id] = t + 15.0
+                    self.loot_goal = None
+                self.progress_anchor = (t, x, y, goal_d)
+        else:
+            self.progress_anchor = None
 
         yaw = math.atan2(goal[1] - y, goal[0] - x)
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.

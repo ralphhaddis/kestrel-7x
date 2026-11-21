@@ -536,35 +536,74 @@ class Decisions(unittest.TestCase):
             B.FLAGS["heal"] = old_heal
 
     def test_proactive_cover_combat_strafe_and_selective_fire(self):
-        bot = B.Bot(copy.deepcopy(HELLO))
-        # 1. Selective fire: during a full act() step with alive > 4, unprovoked full-HP enemy at 120m holds fire
-        o = make_obs(in_zone=True, hp=1400, max_hp=1400)
-        o["t"] = 15.0
-        o["alive"] = 12
-        o["events"] = []
-        x, y, z = o["self"]["pos"]
-        o["self"]["aim"] = [0.0, 0.0]
-        o["mechs"] = [enemy(14, (x + 120.0, y, z))]
-        a_unprov = bot.act(copy.deepcopy(o))
-        self.assertEqual(a_unprov["fire"], [False, False])
+        old = dict(B.FLAGS)
+        B.FLAGS.update(proactive_cover=True, combat_strafe=True, selective_fire=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            # 1. Selective fire: during a full act() step with alive > 4, unprovoked full-HP enemy at 120m holds fire
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            o["t"] = 15.0
+            o["alive"] = 12
+            o["events"] = []
+            x, y, z = o["self"]["pos"]
+            o["self"]["aim"] = [0.0, 0.0]
+            o["mechs"] = [enemy(14, (x + 120.0, y, z))]
+            a_unprov = bot.act(copy.deepcopy(o))
+            self.assertEqual(a_unprov["fire"], [False, False])
 
-        # Finishable low-HP enemy at 120m breaks selective_fire ceasefire
-        o_low = copy.deepcopy(o)
-        o_low["mechs"][0]["hp"] = 300
-        a_finish = bot.act(o_low)
-        self.assertTrue(a_finish["fire"][0])
+            # Finishable low-HP enemy at 120m breaks selective_fire ceasefire
+            o_low = copy.deepcopy(o)
+            o_low["mechs"][0]["hp"] = 300
+            a_finish = bot.act(o_low)
+            self.assertTrue(a_finish["fire"][0])
 
-        # 2. Combat strafe: when exposed to an enemy at 80m in open ground with no cover, never stands still
-        bot2 = B.Bot(copy.deepcopy(HELLO))
-        bot2.world = None
-        o_strafe = make_obs(in_zone=True, hp=1400, max_hp=1400)
-        cx, cy = o_strafe["zone"]["next_center"]
-        o_strafe["self"]["pos"] = [cx, cy, 0.0]
-        o_strafe["zone"]["next_radius"] = 300.0
-        o_strafe["mechs"] = [enemy(9, (cx + 80.0, cy, 0.0))]
-        o_strafe["events"] = []
-        a_st = bot2.act(o_strafe)
-        self.assertGreater(math.hypot(*a_st["move"]), 0.5)
+            # 2. Combat strafe: when exposed to an enemy at 80m in open ground with no cover, never stands still
+            bot2 = B.Bot(copy.deepcopy(HELLO))
+            bot2.world = None
+            o_strafe = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            cx, cy = o_strafe["zone"]["next_center"]
+            o_strafe["self"]["pos"] = [cx, cy, 0.0]
+            o_strafe["zone"]["next_radius"] = 300.0
+            o_strafe["mechs"] = [enemy(9, (cx + 80.0, cy, 0.0))]
+            o_strafe["events"] = []
+            a_st = bot2.act(o_strafe)
+            self.assertGreater(math.hypot(*a_st["move"]), 0.5)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_early_weapon_local_floor_and_detour(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["early_weapon"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400, max_hp=1400)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=300.0, shrink_end=o["t"] + 80.0)
+            # Place a laser 110m away (> old 40m cutoff) on ground level at its own coordinates
+            px, py = x + 110.0, y
+            pz = WORLD.ground_z(px, py)
+            o["pickups"] = [{"id": 8999, "kind": "laser", "pos": [px, py, pz]}]
+            o["mechs"] = []
+            bot.update_memory(o)
+            bot.choose_take(o, o["self"])
+            self.assertEqual(bot.loot_goal, (px, py))
+            # Pickup remains remembered on the next tick even if FOV turns away
+            o2 = copy.deepcopy(o)
+            o2["t"] += 0.1
+            o2["pickups"] = []
+            bot.update_memory(o2)
+            bot.choose_take(o2, o2["self"])
+            self.assertEqual(bot.loot_goal, (px, py))
+            # Stall after 2.3s with zero displacement blacklists pickup 8999
+            bot.act(copy.deepcopy(o))
+            o_stall = copy.deepcopy(o)
+            o_stall["t"] += 2.3
+            bot.act(o_stall)
+            self.assertIn(8999, bot.bad_pickups)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
 
 
 if __name__ == "__main__":
