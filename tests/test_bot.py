@@ -1667,6 +1667,93 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_weapon_dps_quantized_cd_interleave_and_mortar_gate(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["weapon_dps"] = True
+        B.FLAGS["mortar"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=100.0)
+            mx, my, mz = o["self"]["pos"]
+            # 1. Tick-quantized lightning cooldown (0.10 <= 0.105 fires)
+            lt_st = dict(HELLO["config"]["weapons"]["lightning"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "lightning", "cooldown": 0.10, "stats": lt_st},
+            ]
+            e = enemy(7, (mx + 30.0, my, mz))
+            o["mechs"] = [e]
+            o["self"]["aim"] = [0.0, 0.0]
+            bot.target_has_los = True
+            act_lt = bot.combat(o, o["self"])
+            self.assertTrue(act_lt["fire"][1])
+
+            # 2. Gun-during-laser-charge interleaving + pre-release snap to direct
+            laser_st = dict(HELLO["config"]["weapons"]["laser"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": 0.20, "stats": laser_st},
+            ]
+            e_mv = enemy(7, (mx + 100.0, my, mz), vel=(0.0, 12.0, 0.0))
+            o["mechs"] = [e_mv]
+            act_mid = bot.combat(o, o["self"])
+            self.assertGreater(act_mid["aim"][0], 0.02, "Should aim led during early laser charge")
+            o["self"]["weapons"][1]["charge"] = 0.65
+            act_snap = bot.combat(o, o["self"])
+            self.assertLess(abs(act_snap["aim"][0]), 0.01, "Should snap back to direct 1 tick pre-release")
+
+            # 3. Mortar LOS gate: moving target with ready gun keeps gun aim instead of mortar
+            m_st = dict(HELLO["config"]["weapons"]["mortar"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "mortar", "cooldown": 0.0, "stats": m_st},
+            ]
+            act_mv = bot.combat(o, o["self"])
+            self.assertLess(act_mv["aim"][1], 0.1, "Should not steal LOS gun aim for moving target")
+            e_mv["charging"] = True
+            act_ch = bot.combat(o, o["self"])
+            self.assertGreater(act_ch["aim"][1], 0.08, "Should fire mortar at charging laser target")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_tactical_micro_arc_partial_cover_bullet_surf_and_drop_overwatch(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["tactical_micro"] = True
+        B.FLAGS["cover"] = True
+        B.FLAGS["drops"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            # 1. Angular span math
+            self.assertAlmostEqual(B.Bot._angular_span(0.0, 0.0, [(10.0, 0.0), (-10.0, 0.0)]), math.pi, places=4)
+            self.assertLess(B.Bot._angular_span(0.0, 10.0, [(10.0, 0.0), (-10.0, 0.0)]), math.pi * 0.6)
+
+            # 2. Bullet-stream CPA surf preserves laser charge & respects final-circle zrad <= 6.0
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(center=[mx, my], radius=200.0, next_center=[mx, my], next_radius=200.0)
+            o["projectiles"] = [{"id": 99, "kind": "gun", "pos": [mx + 80.0, my, mz + 4.5], "vel": [-252.0, 0.0, 0.0]}]
+            surf = bot.choose_bullet_surf(o, o["self"], mx, my)
+            self.assertIsNotNone(surf)
+            self.assertFalse(bot.evading)
+            o["zone"]["radius"] = 5.0
+            self.assertIsNone(bot.choose_bullet_surf(o, o["self"], mx, my))
+
+            # 3. Staged drop overwatch stages 18-35m away when lands_in > 2.5s
+            o["zone"].update(center=[mx, my], radius=200.0, next_center=[mx, my], next_radius=200.0)
+            o["projectiles"] = []
+            dr = {"id": 50, "pos": [mx + 40.0, my, mz], "radius": 8.0, "lands_in": 6.0, "holder": None, "progress": 0.0}
+            stage = bot.choose_drop_overwatch(o, o["self"], dr, mx, my, 160.0)
+            self.assertIsNotNone(stage)
+            d_stage = math.hypot(stage[0] - dr["pos"][0], stage[1] - dr["pos"][1])
+            self.assertGreaterEqual(d_stage, 16.0)
+            self.assertLessEqual(d_stage, 36.0)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()
