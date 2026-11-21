@@ -16,13 +16,16 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "kit", "check"))
 
 import bot as B  # noqa: E402
+import world_map as wm  # noqa: E402
 from check import Schema  # noqa: E402
 
 with gzip.open(os.path.join(ROOT, "kit", "check", "stream.jsonl.gz"), "rt") as f:
     MSGS = [json.loads(line) for line in f if line.strip()]
 HELLO = MSGS[0]
+HELLO.setdefault("map", {})["dir"] = os.path.join(ROOT, "kit", "arena")
 OBS = [m for m in MSGS if m.get("type") == "obs"]
 SCHEMA = Schema(os.path.join(ROOT, "kit", "mechfight.schema.json"))
+WORLD = wm.WorldMap.load(HELLO)
 
 
 def make_obs(**self_over):
@@ -61,10 +64,61 @@ class Replay(unittest.TestCase):
         self.run_stream({})
 
     def test_replay_stream_all_flags(self):
-        self.run_stream({"loot": True, "fight": True, "lead": False, "debug": False})
+        self.run_stream({"loot": True, "fight": True, "lead": False, "debug": False, "cover": True})
+        self.run_stream({"loot": True, "fight": True, "lead": False, "debug": False, "cover": False})
 
     def test_replay_stream_no_fight(self):
         self.run_stream({"fight": False})
+
+
+class WorldMapTests(unittest.TestCase):
+    def test_ground_z_range_and_bilinear_smoothness(self):
+        for x in range(-450, 500, 95):
+            for y in range(-300, 350, 80):
+                gz = WORLD.ground_z(x, y)
+                self.assertIsInstance(gz, float)
+                self.assertTrue(math.isfinite(gz))
+                self.assertGreater(gz, -20.0)
+                self.assertLess(gz, 60.0)
+        # Bilinear interpolation inside a single 1 m cell should be linear along midlines
+        x0, y0 = 10.0, 20.0
+        z00 = WORLD.ground_z(x0, y0)
+        z10 = WORLD.ground_z(x0 + 1.0, y0)
+        z01 = WORLD.ground_z(x0, y0 + 1.0)
+        z11 = WORLD.ground_z(x0 + 1.0, y0 + 1.0)
+        self.assertAlmostEqual(WORLD.ground_z(x0 + 0.5, y0), 0.5 * (z00 + z10), places=5)
+        self.assertAlmostEqual(WORLD.ground_z(x0 + 0.5, y0 + 0.5), 0.25 * (z00 + z10 + z01 + z11), places=5)
+
+    def test_is_walkable_spawn_and_out_of_bounds(self):
+        sx, sy, sz = OBS[0]["self"]["pos"]
+        self.assertTrue(WORLD.is_walkable(sx, sy, sz))
+        self.assertTrue(WORLD.is_walkable(sx, sy))
+        self.assertFalse(WORLD.is_walkable(-9999.0, 0.0))
+        self.assertFalse(WORLD.is_walkable(0.0, 9999.0))
+
+    def test_is_walkable_building_and_bridge(self):
+        # Solid building without holes: centroid at base + 1.0 is not walkable
+        bldg = (-37.7, -292.75)  # block 0 prism: base=-5.64, top=24.27, ring around (-37.7, -292.75)
+        self.assertFalse(WORLD.is_walkable(bldg[0], bldg[1], -4.64))
+        self.assertFalse(WORLD.is_walkable(bldg[0], bldg[1]))
+        # High bridge prism: ring around (86.9, 193.7), base=8.91, top=10.91
+        bx, by, b_base = 86.9, 193.7, 8.91
+        self.assertTrue(WORLD.is_walkable(bx, by, b_base - 10.0))
+        if b_base - WORLD.ground_z(bx, by) >= 9.0:
+            self.assertTrue(WORLD.is_walkable(bx, by))
+
+    def test_path_clear(self):
+        sx, sy, sz = OBS[0]["self"]["pos"]
+        self.assertTrue(WORLD.path_clear((sx, sy, sz), (sx + 2.0, sy, WORLD.ground_z(sx + 2.0, sy))))
+        # Path cutting across building prism [-136.6..-83.6] x [-234.3..-215.6], base=-5.64, top=8.61
+        self.assertFalse(WORLD.path_clear((-145.0, -225.0, 0.0), (-75.0, -225.0, 0.0)))
+
+    def test_has_los(self):
+        # Two points high in open air above buildings have LOS
+        self.assertTrue(WORLD.has_los((-100.0, -100.0, 120.0), (100.0, 100.0, 120.0)))
+        # Segment passing straight through building prism at mid-height (base=-5.64, top=24.27 -> mid=9.315)
+        mid_z = (-5.64 + 24.27) / 2.0
+        self.assertFalse(WORLD.has_los((-50.0, -292.5, mid_z), (-25.0, -292.5, mid_z)))
 
 
 class Geometry(unittest.TestCase):
@@ -184,6 +238,67 @@ class Decisions(unittest.TestCase):
         cx, cy = o["zone"]["next_center"]
         o["self"]["pos"] = [cx, cy, 0.0]
         self.assertEqual(self.bot.movement(o, o["self"])["move"], [0.0, 0.0])
+
+    def test_cover_selection_and_hysteresis(self):
+        old_cover = B.FLAGS.get("cover", True)
+        try:
+            B.FLAGS["cover"] = True
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            # Place mech in open ground near building prism 64 (-9.2..-78.0 to 21.5..-96.0), exposed to enemy
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"]["next_center"] = [mx, my]
+            o["zone"]["next_radius"] = 200.0
+            # Enemy in direct LOS just north of the building so stepping behind the building breaks LOS
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            muzzle_h = o["self"]["stats"]["muzzle_height"]
+            self.assertTrue(WORLD.has_los((mx, my, mz + muzzle_h), (ex, ey, ez + muzzle_h)))
+            bearing = math.atan2(ey - my, ex - mx)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = [{"type": "damaged", "amount": 25, "weapon": "gun", "bearing": bearing, "by": 7}]
+            bot.update_memory(o)
+            a1 = bot.movement(o, o["self"])
+            goal1 = getattr(bot, "cover_goal", None)
+            self.assertIsNotNone(goal1, "Expected cover_goal to be selected when FLAGS['cover'] is True")
+            gx, gy = goal1[0], goal1[1]
+            gz = WORLD.ground_z(gx, gy)
+            self.assertTrue(WORLD.is_walkable(gx, gy, gz))
+            muzzle_h = o["self"]["stats"]["muzzle_height"]
+            self.assertFalse(WORLD.has_los((gx, gy, gz + muzzle_h), (ex, ey, ez + muzzle_h)))
+            self.assertGreater(math.hypot(*a1["move"]), 0.0)
+            # Hysteresis: 0.1s later within COVER_HOLD_S, cover_goal remains committed
+            o2 = copy.deepcopy(o)
+            o2["t"] = o["t"] + 0.1
+            o2["tick"] = o["tick"] + 1
+            o2["events"] = []
+            bot.update_memory(o2)
+            bot.movement(o2, o2["self"])
+            self.assertEqual(bot.cover_goal, goal1)
+        finally:
+            B.FLAGS["cover"] = old_cover
+
+    def test_cover_disabled_flag(self):
+        old_cover = B.FLAGS.get("cover", True)
+        try:
+            B.FLAGS["cover"] = False
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            mx, my = -24.0, -292.5
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"]["next_center"] = [mx, my]
+            o["zone"]["next_radius"] = 200.0
+            ex, ey = -55.0, -292.5
+            o["mechs"] = [enemy(7, (ex, ey, WORLD.ground_z(ex, ey)))]
+            o["events"] = [{"type": "damaged", "amount": 25, "weapon": "gun", "bearing": math.pi, "by": 7}]
+            bot.update_memory(o)
+            bot.movement(o, o["self"])
+            self.assertIsNone(getattr(bot, "cover_goal", None))
+        finally:
+            B.FLAGS["cover"] = old_cover
 
 
 if __name__ == "__main__":

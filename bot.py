@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import math
 import random
+from typing import List, Optional, Tuple
 
 import mechfight as mf
+import world_map as wm
 
 FLAGS = {
-    "loot": True,   # detour to and take weapon pickups (kinds in LOOT_PREF)
+    "loot": False,   # detour to and take weapon pickups (kinds in LOOT_PREF)
     "fight": True,   # aim at and shoot enemies
     "lead": True,    # lead moving targets by projectile flight time (gun)
+    "cover": True,   # seek cover when inside the zone and threatened
     "debug": True,   # attach debug drawings (never affects the match)
 }
 
@@ -36,6 +39,8 @@ STUCK_SPEED = 1.0          # m/s: slower than this while walking counts as stuck
 STUCK_AFTER_S = 1.0
 UNSTICK_S = 1.5
 LIGHTNING_ENERGY_RESERVE = 20.0  # keep this much energy for jets
+COVER_HOLD_S = 1.2         # hysteresis commit window so we don't jitter between two corners
+COVER_REACH_M = 2.5        # considered at cover point within this distance
 
 
 def wrap(a: float) -> float:
@@ -58,12 +63,15 @@ class Bot:
         self.npc_r = cfg["npc"]["radius"]
         self.reach = cfg["loot"]["pickup_radius"]
 
+        self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
         self.aggressors = {}    # attacker id -> t it last damaged us
         self.threat = None      # (t, bearing) of the last non-zone damage
         self.last_t = None
         self.dt = 0.1
         self.loot_goal = None   # (x, y) of a pickup to walk to, set by choose_take
+        self.cover_goal: Optional[Tuple[float, float]] = None
+        self.cover_until = -1.0
         self.move_yaw = None    # yaw we are walking along, None when holding still
         self.stuck_s = 0.0
         self.unstick_until = -1.0
@@ -136,7 +144,88 @@ class Bot:
         self.loot_goal = (best["pos"][0], best["pos"][1])
         return {"take": best["id"]} if best_d < self.reach - 0.25 else {}
 
-    # ------------------------------------------------------------------ movement
+    # ------------------------------------------------------------------ cover & movement
+    def known_threats(self, obs: mf.Observation, me) -> List[Tuple[float, float, float]]:
+        """Known enemy eye/muzzle 3D positions from visible/remembered mechs or recent damage bearing."""
+        by_id = {}
+        for m in obs["mechs"]:
+            if m["kind"] == "mech" or m["id"] in self.aggressors:
+                p = m["pos"]
+                by_id[m["id"]] = (p[0], p[1], p[2] + 8.0)
+        for aid, (_, p, _) in self.seen.items():
+            if aid not in by_id and (aid < 16 or aid in self.aggressors):
+                by_id[aid] = (p[0], p[1], p[2] + 8.0)
+        threats = list(by_id.values())
+        if not threats and self.threat is not None and obs["t"] - self.threat[0] <= THREAT_MEMORY_S:
+            x, y, z = me["pos"]
+            b = self.threat[1]
+            tx = x + 60.0 * math.cos(b)
+            ty = y + 60.0 * math.sin(b)
+            tz = self.world.ground_z(tx, ty) if self.world is not None else z
+            threats.append((tx, ty, tz + 8.0))
+        return threats
+
+    def choose_cover(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Optional[Tuple[float, float]]:
+        """Pick a nearby cover position inside `inner` that breaks LOS to known threats."""
+        if not (FLAGS.get("cover") and self.world is not None and me["in_zone"]):
+            self.cover_goal = None
+            return None
+        x, y, z = me["pos"]
+        if math.hypot(cx - x, cy - y) > inner:
+            self.cover_goal = None
+            return None
+        threats = self.known_threats(obs, me)
+        if not threats:
+            self.cover_goal = None
+            return None
+
+        t = obs["t"]
+        st = me["stats"]
+        eye_h = st.get("eye_height", 8.0)
+        mr, mh = st.get("radius"), st.get("height")
+        if t < self.cover_until:
+            if self.cover_goal is None:
+                return None
+            gx, gy = self.cover_goal
+            if math.hypot(gx - cx, gy - cy) <= inner:
+                gz = self.world.ground_z(gx, gy)
+                goal_eye = (gx, gy, gz + eye_h)
+                if any(not self.world.has_los(goal_eye, t_eye) for t_eye in threats) and self.world.path_clear(me["pos"], (gx, gy, gz), radius=mr, height=mh):
+                    return self.cover_goal
+
+        base_angle = math.atan2(cy - y, cx - x)
+        candidates: List[Tuple[float, float]] = [(x, y)]
+        for r in (15.0, 30.0, 45.0):
+            for k in range(10):
+                ang = base_angle + TAU * k / 10.0
+                candidates.append((x + r * math.cos(ang), y + r * math.sin(ang)))
+
+        best_pos: Optional[Tuple[float, float]] = None
+        best_score = -math.inf
+        for px, py in candidates:
+            d_center = math.hypot(px - cx, py - cy)
+            if inner > 3.0 and d_center > inner:
+                continue
+            pz = self.world.ground_z(px, py)
+            cand_eye = (px, py, pz + eye_h)
+            hidden = sum(1 for t_eye in threats if not self.world.has_los(cand_eye, t_eye))
+            if hidden == 0:
+                continue
+            travel = math.hypot(px - x, py - y)
+            score = hidden * 100.0 - travel * 1.0 - d_center * 0.25
+            if score <= best_score:
+                continue
+            if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
+                continue
+            if (px != x or py != y) and not self.world.path_clear(me["pos"], (px, py, pz), radius=mr, height=mh):
+                continue
+            best_score = score
+            best_pos = (px, py)
+
+        self.cover_goal = best_pos
+        self.cover_until = t + (COVER_HOLD_S if best_pos is not None else 0.4)
+        return self.cover_goal
+
     def movement(self, obs: mf.Observation, me) -> dict:
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
@@ -148,28 +237,19 @@ class Bot:
 
         goal = None
         if not me["in_zone"] or d > inner:
+            self.cover_goal = None
             goal = (cx, cy)
-        elif self.threat and t - self.threat[0] < THREAT_MEMORY_S:
-            # Strafe across the incoming fire, keeping the same side across ticks.
-            bearing = self.threat[1]
-            dx, dy = -math.sin(bearing), math.cos(bearing)
-            if self.unstick_side < 0:
-                dx, dy = -dx, -dy
-            if inner > 3:
-                goal = (x + dx, y + dy)
-            else:
+        else:
+            cover = self.choose_cover(obs, me, cx, cy, inner)
+            if cover is not None:
+                if math.hypot(cover[0] - x, cover[1] - y) <= COVER_REACH_M:
+                    goal = None
+                else:
+                    goal = cover
+            elif self.loot_goal is not None:
+                goal = self.loot_goal
+            elif d > settle:
                 goal = (cx, cy)
-        elif self.loot_goal is not None:
-            goal = self.loot_goal
-        elif me.get("cubes", 0) < self.cfg["cubes"]["stat_cap"]:
-            candidates = [c["pos"] for c in obs["cubes"]
-                          if abs(c["pos"][2] - me["pos"][2]) <= 4
-                          and math.dist(c["pos"][:2], (cx, cy)) <= inner
-                          and math.dist(c["pos"][:2], (x, y)) <= 20]
-            if candidates:
-                goal = min(candidates, key=lambda pos: math.dist(pos[:2], (x, y)))
-        if goal is None and d > settle:
-            goal = (cx, cy)
 
         if goal is None:  # hold still: silent, and the gun is steadier
             self.move_yaw = None
@@ -178,12 +258,23 @@ class Bot:
             return {"move": [0.0, 0.0], "boost": False, "jump": False}
 
         yaw = math.atan2(goal[1] - y, goal[0] - x)
+        if self.world is not None:
+            mr, mh = me["stats"].get("radius"), me["stats"].get("height")
+            px, py = x + 10.0 * math.cos(yaw), y + 10.0 * math.sin(yaw)
+            if not self.world.path_clear(me["pos"], (px, py, self.world.ground_z(px, py)), radius=mr, height=mh):
+                for delta in (0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.6, -1.6):
+                    ay = yaw + delta
+                    ax, ay_pos = x + 10.0 * math.cos(ay), y + 10.0 * math.sin(ay)
+                    az = self.world.ground_z(ax, ay_pos)
+                    if self.world.is_walkable(ax, ay_pos, az, radius=mr, height=mh) and self.world.path_clear(me["pos"], (ax, ay_pos, az), radius=mr, height=mh):
+                        yaw = ay
+                        break
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.
         late = d > inner and (d - inner) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
         boost = not me["in_zone"] or late
         jump = False
 
-        # Stuck against something (no map yet): sidestep, jump, and jet up for a moment.
+        # Stuck against something: sidestep, jump, and jet up for a moment.
         if me["grounded"] and math.hypot(me["vel"][0], me["vel"][1]) < STUCK_SPEED:
             self.stuck_s += self.dt
         else:
@@ -197,14 +288,8 @@ class Bot:
             jump = me["grounded"]
             boost = boost or (not me["grounded"] and me["energy"] > 10)
 
-        speed = 1.0
-        if zone["next_radius"] == 0 and t >= self.unstick_until:
-            speed = min(1.0, d / 4.0)
-            if d < 4.0:
-                self.stuck_s = 0.0
-                boost = False
         self.move_yaw = yaw
-        return {"move": [speed * math.cos(yaw), speed * math.sin(yaw)], "boost": bool(boost), "jump": bool(jump)}
+        return {"move": [math.cos(yaw), math.sin(yaw)], "boost": bool(boost), "jump": bool(jump)}
 
     # ------------------------------------------------------------------ combat
     def pick_target(self, obs: mf.Observation, me):
@@ -320,6 +405,8 @@ class Bot:
         x, y, z = me["pos"]
         if tp is not None:
             mf.draw.line([x, y, z + me["stats"]["muzzle_height"]], list(tp), "#ff5040")
+        if self.cover_goal is not None:
+            mf.draw.point([self.cover_goal[0], self.cover_goal[1], z], "#40ff80", 6)
         mf.draw.label(f"{state} | hp {me['hp']:.0f} e {me['energy']:.0f}"[:80])
 
 
