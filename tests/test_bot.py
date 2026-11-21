@@ -966,6 +966,7 @@ class Decisions(unittest.TestCase):
 
     def test_mortar_loot_pickup_flag(self):
         old = dict(B.FLAGS)
+        B.FLAGS["laser_first"] = False
         try:
             o = make_obs(in_zone=True)
             x, y, z = o["self"]["pos"]
@@ -1162,6 +1163,7 @@ class Decisions(unittest.TestCase):
     def test_swap_slot1_sends_take_and_drop(self):
         old = dict(B.FLAGS)
         B.FLAGS["weapon_tri"] = True
+        B.FLAGS["laser_first"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400, max_hp=1400)
@@ -1266,6 +1268,7 @@ class Decisions(unittest.TestCase):
     def test_drop_ignored_when_far_early_or_contested(self):
         old = dict(B.FLAGS)
         B.FLAGS["drops"] = True
+        B.FLAGS["aggressive_drops"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400, max_hp=1400)
@@ -1579,6 +1582,7 @@ class Decisions(unittest.TestCase):
     def test_smart_upgrades_loadout_aware(self):
         old = dict(B.FLAGS)
         B.FLAGS["smart_upgrades"] = True
+        B.FLAGS["w4_combat"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs()
@@ -1663,6 +1667,293 @@ class Decisions(unittest.TestCase):
             e["weapons"] = ["gun", "mortar"]
             act_mortar = bot.combat(o, o["self"])
             self.assertFalse(act_mortar["fire"][1], "Should early-release laser against 280 HP mortar carrier via cookoff")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w4_combat_tick_cds_and_laser_interleave(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["w4_combat"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=100.0)
+            me = o["self"]
+            x, y, z = me["pos"]
+            l_st = dict(HELLO["config"]["weapons"]["laser"])
+            li_st = dict(HELLO["config"]["weapons"]["lightning"])
+
+            # Tick-quantized CDs: lightning fires at cd=0.08, laser starts charging at cd=0.08
+            me["weapons"] = [None, {"kind": "lightning", "cooldown": 0.08, "stats": li_st}]
+            me["aim"] = [0.0, 0.0]
+            o["mechs"] = [enemy(5, (x + 25.0, y, z))]
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+
+            me["weapons"] = [None, {"kind": "laser", "cooldown": 0.08, "charge": 0.0, "stats": l_st}]
+            o["mechs"] = [enemy(5, (x + 100.0, y, z))]
+            self.assertTrue(bot.combat(o, me)["fire"][1])
+
+            # Gun-during-laser-charge interleaving: moving target + gun ready + charge=0.20 -> aims LED
+            gun_w = copy.deepcopy(OBS[0]["self"]["weapons"][0])
+            gun_w["cooldown"] = 0.05
+            laser_w = {"kind": "laser", "cooldown": 0.0, "charge": 0.20, "stats": l_st}
+            me["weapons"] = [gun_w, laser_w]
+            o["mechs"] = [enemy(5, (x + 120.0, y, z), (0.0, 22.0, 0.0))]
+            a_mid = bot.combat(o, me)
+            self.assertGreater(a_mid["aim"][0], 0.05, "Should aim led for gun while laser is mid-charge")
+
+            # 1-tick pre-release snap: charge = full - 0.10 -> snaps to DIRECT (yaw ~ 0)
+            laser_w["charge"] = l_st["charge"] - 0.10
+            a_snap = bot.combat(o, me)
+            self.assertLess(abs(a_snap["aim"][0]), 0.02, "Should snap to direct 1 tick before full laser charge")
+
+            # 1-tick pre-release snap on next-tick early lethal finish
+            laser_w["charge"] = 0.20
+            o["mechs"][0]["hp"] = 200.0  # next_charge=0.35 est_dmg ~ 206 >= 200
+            a_lethal_snap = bot.combat(o, me)
+            self.assertLess(abs(a_lethal_snap["aim"][0]), 0.02, "Should snap to direct 1 tick before early-release lethal")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w4_combat_exact_upgrades_and_nanites_stack(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["smart_upgrades"] = True
+        B.FLAGS["w4_combat"] = True
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs()
+            o["alive"] = 12
+            o["self"]["upgrades"] = []
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0, "charge": 0, "stats": dict(HELLO["config"]["weapons"]["laser"])},
+            ]
+            def offer(*ids):
+                o["offer"] = {"id": 1, "expires": 9, "choices": [{"id": i, "name": "", "desc": ""} for i in ids]}
+                return bot.choose_pick(o)["pick"]
+
+            # armor (100) > plating (98) > nanites stack-1 (94) > laser_damage (86) > laser_charge (85) > gun_mag (84)
+            self.assertEqual(offer("plating", "armor", "nanites"), 1)
+            self.assertEqual(offer("nanites", "plating", "laser_damage"), 1)
+            self.assertEqual(offer("laser_damage", "nanites", "gun_mag"), 1)
+            self.assertEqual(offer("laser_charge", "laser_damage", "gun_mag"), 1)
+            self.assertEqual(offer("gun_rate", "gun_mag", "gun_damage"), 1)
+            # Stack-2 nanites (88) still beats laser_damage (86)
+            o["self"]["upgrades"] = ["nanites"]
+            self.assertEqual(offer("laser_damage", "nanites", "gun_mag"), 1)
+            # sensors: 76 when alive > 8 (beats gun_rate 74), 58 when alive <= 8 (loses to servos 65)
+            self.assertEqual(offer("gun_rate", "sensors", "servos"), 1)
+            o["alive"] = 6
+            self.assertEqual(offer("sensors", "servos", "gyros"), 1)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w4_combat_angular_span_and_partial_cover_boost(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w4_combat=True, cover=True, corner_cover=True, energy_mgmt=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            # Angular span helper: opposite points = pi; close points < 0.2; 3 surrounded points > pi
+            self.assertAlmostEqual(bot._angular_span(0.0, 0.0, [(10.0, 0.0), (-10.0, 0.0)]), math.pi, places=4)
+            self.assertLess(bot._angular_span(0.0, 0.0, [(10.0, 0.0), (10.0, 1.0)]), 0.2)
+            self.assertGreater(bot._angular_span(0.0, 0.0, [(10.0, 0.0), (-5.0, 9.0), (-5.0, -9.0)]), math.pi)
+
+            # Emergency cover boost when recently hit, exposed, HP < 70%, energy > 45
+            o = make_obs(in_zone=True, hp=800.0, max_hp=1400.0, energy=70.0)
+            mx, my = 29.5, -74.0
+            mz = WORLD.ground_z(mx, my)
+            o["self"]["pos"] = [mx, my, mz]
+            o["zone"].update(center=[mx, my], radius=300.0, next_center=[mx, my], next_radius=200.0)
+            ex, ey = -29.2, -74.0
+            ez = WORLD.ground_z(ex, ey)
+            o["mechs"] = [enemy(7, (ex, ey, ez))]
+            o["events"] = [{"type": "damaged", "amount": 25, "weapon": "gun",
+                            "bearing": math.atan2(ey - my, ex - mx), "by": 7}]
+            bot.update_memory(o)
+            a = bot.movement(o, o["self"])
+            self.assertIsNotNone(bot.cover_goal)
+            self.assertTrue(a["boost"], "Should boost to cover when recently hit, exposed, HP<70%, energy>45")
+
+            # Healthy HP (>= 70%): does NOT emergency-boost to cover
+            o["self"]["hp"] = 1200.0
+            a_hi = bot.movement(o, o["self"])
+            self.assertFalse(a_hi["boost"])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_laser_first_zero_mortar_hill_floor_and_detour(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["laser_first"] = True
+        B.FLAGS["early_weapon"] = False
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+
+            # 1. Never picks up mortar
+            o["pickups"] = [{"id": 8501, "kind": "mortar", "pos": [x + 2.0, y, z]}]
+            self.assertEqual(bot.choose_take(o, o["self"]), {})
+            self.assertIsNone(bot.loot_goal)
+
+            # 2. Safe 75m laser detour allowed (65m > 40m), but lightning at 65m rejected
+            px, py = x + 65.0, y
+            pz = WORLD.ground_z(px, py)
+            o["pickups"] = [{"id": 8502, "kind": "lightning", "pos": [px, py, pz]}]
+            bot.choose_take(o, o["self"])
+            self.assertIsNone(bot.loot_goal)
+
+            o["pickups"] = [{"id": 8503, "kind": "laser", "pos": [px, py, pz]}]
+            bot.choose_take(o, o["self"])
+            self.assertEqual(bot.loot_goal, (px, py))
+
+            # 3. 75m laser detour blocked if HP < 85% or any enemy mech visible
+            o["self"]["hp"] = 1000.0
+            bot.choose_take(o, o["self"])
+            self.assertIsNone(bot.loot_goal)
+            o["self"]["hp"] = 1400.0
+            o["mechs"] = [enemy(9, (x + 120.0, y, z))]
+            bot.choose_take(o, o["self"])
+            self.assertIsNone(bot.loot_goal)
+            o["mechs"] = []
+
+            # 4. Smarter lightning -> laser swap up to 35m in open zone (> 70m) with no enemies
+            li_w = {"kind": "lightning", "cooldown": 0.0, "stats": dict(HELLO["config"]["weapons"]["lightning"])}
+            o["self"]["weapons"] = [o["self"]["weapons"][0], li_w]
+            sx, sy = x + 30.0, y
+            sz = WORLD.ground_z(sx, sy)
+            o["pickups"] = [{"id": 8504, "kind": "laser", "pos": [sx, sy, sz]}]
+            bot.choose_take(o, o["self"])
+            self.assertEqual(bot.loot_goal, (sx, sy))
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_aggressive_drops_eta_boost_holder_and_finish_commit(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(drops=True, aggressive_drops=True, energy_mgmt=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=80.0)
+            o["t"] = 40.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=250.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["events"] = []
+
+            # 1. ETA-timed 150m drop rotation: 120m away, lands_in=5s (eta_walk ~ 7s -> 5 <= 9) accepted; lands_in=20s rejected
+            o["drops"] = [{"id": 701, "pos": [x + 120.0, y, z], "radius": 8.0, "lands_in": 20.0,
+                           "holder": None, "progress": 0.0, "capture_s": 4.0}]
+            self.assertIsNone(bot.choose_drop(o, me, x, y, 200.0))
+
+            o["drops"][0]["lands_in"] = 0.5
+            a_sec = bot.movement(o, me)
+            self.assertGreater(a_sec["move"][0], 0.9)
+            self.assertTrue(a_sec["boost"], "Should boost-to-secure uncontested landed drop")
+
+            # 2. Boost-to-freeze enemy holder + holder focus (0.55x) in pick_target
+            e_holder = enemy(7, (x + 40.0, y, z))
+            e_other = enemy(8, (x - 30.0, y, z))
+            o["mechs"] = [e_other, e_holder]
+            o["drops"] = [{"id": 702, "pos": [x + 40.0, y, z], "radius": 8.0, "lands_in": 0.0,
+                           "holder": 7, "progress": 1.0, "capture_s": 4.0}]
+            a_frz = bot.movement(o, me)
+            self.assertTrue(a_frz["boost"], "Should boost-to-freeze enemy drop holder")
+            self.assertEqual(bot.active_drop_holder, 7)
+            self.assertEqual(bot.pick_target(o, me)["id"], 7)
+
+            # 3. Finish commitment: holder == me, rem_cap <= 2.5s, hp > 350 -> stays in ring even under threat
+            o["mechs"] = [enemy(8, (x + 30.0, y, z))]
+            o["drops"] = [{"id": 703, "pos": [x + 2.0, y, z], "radius": 8.0, "lands_in": 0.0,
+                           "holder": me["id"], "progress": 2.0, "capture_s": 4.0}]
+            me["hp"] = 400.0
+            bot.threat = (o["t"], 0.0)
+            a_fin = bot.movement(o, me)
+            self.assertEqual(a_fin["move"], [0.0, 0.0])
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_farm_npc_safe_farming_and_cube_sweep(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(farm_npc=True, cubes=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, cubes=2)
+            o["t"] = 25.0
+            me = o["self"]
+            x, y, z = me["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["crates"] = []
+            o["pickups"] = []
+            o["drops"] = []
+            o["events"] = []
+
+            # 1. Safe NPC within 45m targeted & approached when > 22m
+            o["mechs"] = [enemy(105, (x + 35.0, y, z), kind="npc")]
+            o["cubes"] = []
+            am = bot.movement(o, me)
+            self.assertIsNotNone(bot.npc_farm_target)
+            self.assertEqual(bot.npc_farm_target["id"], 105)
+            self.assertGreater(am["move"][0], 0.9)
+            self.assertEqual(bot.pick_target(o, me)["id"], 105)
+
+            # 2. Rejected if cubes >= 6 or enemy mech visible
+            me["cubes"] = 6
+            bot.movement(o, me)
+            self.assertIsNone(bot.npc_farm_target)
+            me["cubes"] = 2
+            o["mechs"].append(enemy(4, (x + 120.0, y, z), kind="mech"))
+            bot.movement(o, me)
+            self.assertIsNone(bot.npc_farm_target)
+
+            # 3. Uncontested 35m cube sweep (30m > 20m baseline)
+            o["mechs"] = []
+            bot.seen.clear()
+            o["cubes"] = [{"id": 301, "pos": [x + 30.0, y, z], "amount": 1}]
+            am_cube = bot.movement(o, me)
+            self.assertGreater(am_cube["move"][0], 0.9)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_early_survival_delayed_convergence(self):
+        old = dict(B.FLAGS)
+        B.FLAGS["early_survival"] = True
+        B.FLAGS["kite"] = False
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True)
+            cx, cy = o["zone"]["next_center"]
+            o["zone"].update(next_radius=200.0, shrink_start=60.0, shrink_end=120.0)
+            o["t"] = 20.0
+            o["alive"] = 14
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+            # Distance = 140m (0.70 * 200m): inside 0.78R (156m) -> holds still early
+            px, py = cx + 140.0, cy
+            o["self"]["pos"] = [px, py, WORLD.ground_z(px, py)]
+            a_early = bot.movement(o, o["self"])
+            self.assertEqual(a_early["move"], [0.0, 0.0])
+
+            # After t >= shrink_start - 10 (t=52): settle drops to 0.50R (100m) -> moves inward
+            o["t"] = 52.0
+            a_late = bot.movement(o, o["self"])
+            self.assertLess(a_late["move"][0], -0.5)
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
