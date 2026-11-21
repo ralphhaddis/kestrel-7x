@@ -2091,6 +2091,111 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_w6_crossfire_escape_ignores_npc_threat_hijack_when_mech_present(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w6_crossfire_escape=True, cover=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            o = make_obs(in_zone=True, hp=1200.0, max_hp=1400.0)
+            o["t"] = 12.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            # Enemy mech #8 is east of us (+X), while NPC drone #105 is north of us (+Y)
+            e_mech = enemy(8, (x + 55.0, y, z))
+            e_npc = {"id": 105, "kind": "npc", "pos": [x, y + 15.0, z], "vel": [0.0, 0.0, 0.0], "hp": 350.0, "max_hp": 350.0}
+            o["mechs"] = [e_mech, e_npc]
+            # Enemy mech hits us first from due east (bearing 0.0), then NPC hits us from due north (bearing pi/2)
+            o["events"] = [
+                {"type": "damaged", "by": 8, "amount": 18.0, "bearing": 0.0},
+                {"type": "damaged", "by": 105, "amount": 25.0, "bearing": math.pi / 2.0},
+            ]
+            bot.update_memory(o)
+            # NPC hit must NOT overwrite self.threat when a real enemy mech is visible
+            self.assertEqual(bot.threat_id, 8)
+            self.assertAlmostEqual(bot.threat[1], 0.0, places=3)
+            # known_threats must only include the enemy mech (#8), not the NPC (#105)
+            kts = bot.known_threats(o, o["self"])
+            self.assertEqual(len(kts), 1)
+            self.assertAlmostEqual(kts[0][0], x + 55.0, places=2)
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w6_pinch_escape_and_anti_rusher_backpedal(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w6_crossfire_escape=True, w4_combat=True, cover=False)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1100.0, max_hp=1400.0, energy=80.0)
+            o["t"] = 20.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = [{"type": "damaged", "by": 3, "amount": 18.0, "bearing": 0.0}]
+            # 1. 1v2 pinch at ~150 deg (> 2.10 rad): steps out of pinch and boosts
+            e1 = enemy(3, (x + 45.0, y + 12.0, z))
+            e2 = enemy(4, (x - 45.0, y + 12.0, z))
+            o["mechs"] = [e1, e2]
+            bot.update_memory(o)
+            am1 = bot.movement(o, o["self"])
+            self.assertTrue(am1["boost"], "Should boost out of >120-deg 1v2 pinch")
+            self.assertLess(am1["move"][1], -0.3, "Should step south away from northern 1v2 pinch")
+
+            # 2. 1v1 close rusher (< 30 m) when we don't have lightning: diagonal backpedal + boost
+            e_rush = enemy(5, (x + 22.0, y, z))
+            o["mechs"] = [e_rush]
+            o["self"]["weapons"] = [o["self"]["weapons"][0], None]
+            bot.update_memory(o)
+            am2 = bot.movement(o, o["self"])
+            self.assertTrue(am2["boost"], "Should boost away from <30m rusher when lacking lightning")
+            self.assertLess(am2["move"][0], -0.4, "Should backpedal west away from eastern rusher")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w6_endgame_mastery_tight_settle_and_energy_reserve(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w6_endgame_mastery=True, energy_mgmt=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=36.0)
+            o["t"] = 180.0
+            x, y, z = o["self"]["pos"]
+            # Distance to next_center is 10m; in next_radius=25m, 0.5*R=12.5m would settle,
+            # but w6_endgame_mastery tightens settle to 0.32*R = 8.0m so it keeps advancing toward center.
+            o["zone"].update(center=[x + 10.0, y], radius=30.0, next_center=[x + 10.0, y], next_radius=25.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+            bot.update_memory(o)
+            am = bot.movement(o, o["self"])
+            self.assertGreater(am["move"][0], 0.5, "Should advance inside 0.5R down to 0.32R in final circles")
+
+            # Non-urgent lightning zap at 35m requires cost (3) + endgame reserve (38) = 41 energy
+            l_st = dict(HELLO["config"]["weapons"]["lightning"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "lightning", "cooldown": 0.0, "stats": l_st},
+            ]
+            o["self"]["energy"] = 36.0  # > 3 + 30 (33), but < 3 + 38 (41)
+            e_mid = enemy(7, (x + 32.0, y, z))
+            o["mechs"] = [e_mid]
+            o["self"]["aim"] = [0.0, 0.0]
+            bot.target_has_los = True
+            ac = bot.combat(o, o["self"])
+            self.assertFalse(ac["fire"][1], "Should reserve 38 energy against non-urgent lightning zap in final circles")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()

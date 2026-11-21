@@ -47,6 +47,9 @@ FLAGS = {
     "w5_safe_bound": True,    # W5-1: slack-time dynamic safe boundary so d > inner doesn't disable cover/loot/micro in outer 54% spawns
     "w5_laser_mastery": True, # W5-2: committed lateral laser dodge (no centerline ping-pong) + hold_s no-LOS timeout release
     "w5_nav_mastery": True,   # W5-3: zero-jitter A* caching + stuck waypoint blacklisting + endgame circle mastery
+    "w6_crossfire_escape": True, # W6-1: radial 48m cover fallback + boosted pinch escape + anti-rusher backpedal + NPC-fire dodge
+    "w6_loot_hunt": True,     # W6-2: safe 62m lightning & 85m unboosted laser detour when slot 1 is empty and zero enemies visible
+    "w6_endgame_mastery": True, # W6-3: energy reserve & tight center control in final circles (next_radius <= 35m)
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -193,11 +196,18 @@ class Bot:
         for e in obs["events"]:
             if e.get("type") == "damaged":
                 self.last_damaged_t = t
-                if e.get("by") is not None:
-                    self.aggressors[e["by"]] = t
+                by = e.get("by")
+                if by is not None:
+                    self.aggressors[by] = t
                     if e.get("bearing") is not None:
-                        self.threat = (t, e["bearing"])
-                        self.threat_id = e["by"]
+                        if (FLAGS.get("w6_crossfire_escape", True)
+                                and int(by) >= 100
+                                and (any(m.get("kind") == "mech" for m in obs["mechs"])
+                                     or any(aid < 16 for aid in self.seen))):
+                            pass
+                        else:
+                            self.threat = (t, e["bearing"])
+                            self.threat_id = by
         for e in obs["events"]:
             if e.get("type") == "kill":
                 target = e["target"]
@@ -478,7 +488,8 @@ class Bot:
             return {}
 
         early_w = FLAGS.get("early_weapon", False)
-        max_detour = 85.0 if early_w else (75.0 if use_lf else LOOT_DETOUR_M)
+        w6_loot = FLAGS.get("w6_loot_hunt", True)
+        max_detour = 85.0 if early_w else (85.0 if (use_lf and w6_loot) else (75.0 if use_lf else LOOT_DETOUR_M))
         st = me["stats"]
         mr, mh = st.get("radius"), st.get("height")
         enemy_has_los: Optional[bool] = None
@@ -498,7 +509,10 @@ class Bot:
                 if d >= max_detour:
                     continue
             else:
-                kind_max_d = 75.0 if (use_lf and pk == "laser") else LOOT_DETOUR_M
+                if use_lf and w6_loot:
+                    kind_max_d = 85.0 if pk == "laser" else (62.0 if pk == "lightning" else LOOT_DETOUR_M)
+                else:
+                    kind_max_d = 75.0 if (use_lf and pk == "laser") else LOOT_DETOUR_M
                 if d > kind_max_d:
                     continue
             rank = (d - 0.5 * self.weapon_score(pk, obs)) if use_tri else d
@@ -555,22 +569,28 @@ class Bot:
     # ------------------------------------------------------------------ cover & movement
     def known_threats(self, obs: mf.Observation, me) -> List[Tuple[float, float, float]]:
         """Known enemy eye/muzzle 3D positions from visible/remembered mechs or recent damage bearing."""
+        w6_esc = FLAGS.get("w6_crossfire_escape", True)
+        has_mech_threat = w6_esc and (
+            any(m.get("kind") == "mech" for m in obs["mechs"])
+            or any(aid < 16 for aid in self.seen)
+        )
         by_id = {}
         for m in obs["mechs"]:
-            if m["kind"] == "mech" or m["id"] in self.aggressors:
+            if m["kind"] == "mech" or (m["id"] in self.aggressors and not has_mech_threat):
                 p = m["pos"]
                 by_id[m["id"]] = (p[0], p[1], p[2] + 8.0)
         for aid, (_, p, _) in self.seen.items():
-            if aid not in by_id and (aid < 16 or aid in self.aggressors):
+            if aid not in by_id and (aid < 16 or (aid in self.aggressors and not has_mech_threat)):
                 by_id[aid] = (p[0], p[1], p[2] + 8.0)
         threats = list(by_id.values())
         if self.threat_id not in by_id and self.threat is not None and obs["t"] - self.threat[0] <= THREAT_MEMORY_S:
-            x, y, z = me["pos"]
-            b = self.threat[1]
-            tx = x + 60.0 * math.cos(b)
-            ty = y + 60.0 * math.sin(b)
-            tz = self.world.ground_z(tx, ty) if self.world is not None else z
-            threats.append((tx, ty, tz + 8.0))
+            if not (has_mech_threat and self.threat_id is not None and int(self.threat_id) >= 100):
+                x, y, z = me["pos"]
+                b = self.threat[1]
+                tx = x + 60.0 * math.cos(b)
+                ty = y + 60.0 * math.sin(b)
+                tz = self.world.ground_z(tx, ty) if self.world is not None else z
+                threats.append((tx, ty, tz + 8.0))
         return threats
 
     @staticmethod
@@ -662,7 +682,8 @@ class Bot:
             return None
 
         base_angle = math.atan2(cy - y, cx - x)
-        radii = (12.0, 24.0, 36.0, 48.0) if FLAGS.get("proactive_cover", False) else (12.0, 24.0, 36.0)
+        w6_esc = FLAGS.get("w6_crossfire_escape", True)
+        radii = (12.0, 24.0, 36.0, 48.0) if (FLAGS.get("proactive_cover", False) or w6_esc) else (12.0, 24.0, 36.0)
         n_exposed = len(exposed_threats)
         n_unexposed = len(unexposed_threats)
         n_threats = n_exposed + n_unexposed
@@ -722,7 +743,7 @@ class Bot:
                 best_partial = False
 
         if FLAGS.get("corner_cover", True):
-            for px, py in self.world.nearby_corners(x, y, max_r=42.0, limit=20):
+            for px, py in self.world.nearby_corners(x, y, max_r=48.0 if w6_esc else 42.0, limit=20):
                 eval_cand(px, py, math.hypot(px - x, py - y))
 
         if best_pos is None:
@@ -1302,6 +1323,11 @@ class Bot:
 
         w4c = FLAGS.get("w4_combat", True)
         w5_nav = FLAGS.get("w5_nav_mastery", True)
+        w6_esc = FLAGS.get("w6_crossfire_escape", True)
+        w6_loot = FLAGS.get("w6_loot_hunt", True)
+        w6_end = FLAGS.get("w6_endgame_mastery", True)
+        if w6_end and zone["next_radius"] <= 35.0:
+            settle = max(zone["next_radius"] * 0.32, 2.0)
         agg_drops = FLAGS.get("aggressive_drops", True)
         late_r = max(strict_inner, 4.0) if zone["next_radius"] == 0 else strict_inner
         self.late = d > late_r and (d - late_r) > 0.8 * me["stats"]["walk_speed"] * max(zone["shrink_end"] - t, 0.0)
@@ -1312,6 +1338,8 @@ class Bot:
         kite_boost = False
         cover_boost = False
         drop_boost = False
+        loot_boost = False
+        is_arc_step = False
         goal = None
         evade_goal, evade_boost = self.choose_evade(obs, me, cx, cy, inner)
         if evade_goal is not None:
@@ -1352,7 +1380,7 @@ class Bot:
                         if (w4c and dist_c > COVER_REACH_M
                                 and (self.threat is not None and t - self.threat[0] < THREAT_MEMORY_S)
                                 and self.cover_exposed
-                                and me["hp"] < 0.70 * me["max_hp"]
+                                and (me["hp"] < 0.70 * me["max_hp"] or (w6_esc and len([m for m in obs["mechs"] if m.get("kind") == "mech"]) >= 2))
                                 and me["energy"] > 45.0):
                             cover_boost = True
                 else:
@@ -1362,8 +1390,11 @@ class Bot:
                         goal = kite_goal
                         if (self.healing or kite_td < 45.0) and me["energy"] > 35.0:
                             kite_boost = True
-                    elif self.threat and t - self.threat[0] < THREAT_MEMORY_S:
-                        # Post-hit strafe fallback when no cover building is nearby, checked against walls.
+                    elif (self.threat and t - self.threat[0] < THREAT_MEMORY_S
+                          and not (w6_esc and self.threat_id is not None and int(self.threat_id) >= 100
+                                   and (any(m.get("kind") == "mech" for m in obs["mechs"])
+                                        or any(aid < 16 for aid in self.seen)))):
+                        # Post-hit strafe / pinch escape / anti-rusher backpedal when no cover building is nearby.
                         bearing = self.threat[1]
                         if FLAGS.get("combat_strafe", False) and t >= self.strafe_flip_t:
                             self.unstick_side = -self.unstick_side
@@ -1377,12 +1408,13 @@ class Bot:
                             ]
                             if len(arc_pts) >= 2:
                                 cur_span = self._angular_span(x, y, arc_pts)
-                                if cur_span > 2.618:
+                                if cur_span > (2.10 if w6_esc else 2.618):
                                     mr, mh = me["stats"].get("radius"), me["stats"].get("height")
+                                    step_arc = 14.0 if w6_esc else 8.0
                                     best_span = cur_span
-                                    for k_ang in range(8):
-                                        ang = TAU * k_ang / 8.0
-                                        sx, sy = x + 8.0 * math.cos(ang), y + 8.0 * math.sin(ang)
+                                    for k_ang in range(12 if w6_esc else 8):
+                                        ang = TAU * k_ang / (12.0 if w6_esc else 8.0)
+                                        sx, sy = x + step_arc * math.cos(ang), y + step_arc * math.sin(ang)
                                         if math.hypot(sx - cx, sy - cy) > inner:
                                             continue
                                         if self.world is not None:
@@ -1394,8 +1426,32 @@ class Bot:
                                         if sp < best_span:
                                             best_span = sp
                                             arc_goal = (sx, sy)
+                                    if arc_goal is not None and w6_esc and me["energy"] > 45.0:
+                                        cover_boost = True
+                            elif w6_esc and len(arc_pts) == 1:
+                                # 1v1 close-quarters rusher (< 42 m) when we do not hold lightning: diagonal backpedal
+                                held_k = {w["kind"] for w in me["weapons"] if w}
+                                ed_1v1 = math.hypot(arc_pts[0][0] - x, arc_pts[0][1] - y)
+                                if ed_1v1 < 42.0 and "lightning" not in held_k:
+                                    away_a = math.atan2(y - arc_pts[0][1], x - arc_pts[0][0])
+                                    mr, mh = me["stats"].get("radius"), me["stats"].get("height")
+                                    for da in (0.55 * self.unstick_side, -0.55 * self.unstick_side, 0.0, 1.0 * self.unstick_side, -1.0 * self.unstick_side):
+                                        ang = away_a + da
+                                        sx, sy = x + 12.0 * math.cos(ang), y + 12.0 * math.sin(ang)
+                                        if math.hypot(sx - cx, sy - cy) > inner:
+                                            continue
+                                        if self.world is not None:
+                                            sz = self.world.support_z(sx, sy, me["pos"][2])
+                                            if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
+                                                    and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
+                                                continue
+                                        arc_goal = (sx, sy)
+                                        if ed_1v1 < 30.0 and me["energy"] > 50.0:
+                                            cover_boost = True
+                                        break
                         if arc_goal is not None:
                             goal = arc_goal
+                            is_arc_step = True
                         else:
                             dx, dy = -math.sin(bearing), math.cos(bearing)
                             if self.unstick_side < 0:
@@ -1485,8 +1541,12 @@ class Bot:
                                 if math.hypot(nx - x, ny - y) > 22.0:
                                     goal = (nx, ny)
                     if (goal is None and cover is None and not hold_drop_ring
-                            and self.crate_target is None and self.npc_farm_target is None and d > settle):
-                        goal = (cx, cy)
+                            and self.crate_target is None and self.npc_farm_target is None):
+                        if w6_esc and not any(m.get("kind") == "mech" for m in obs["mechs"]) and any(aid >= 100 for aid in self.aggressors):
+                            # Being chipped by an aggroed NPC while not farming it: step away toward next_center
+                            goal = (cx, cy)
+                        elif d > settle:
+                            goal = (cx, cy)
 
         if goal is None:  # hold still: silent, and the gun is steadier
             self.move_yaw = None
@@ -1514,6 +1574,7 @@ class Bot:
         steer_target = goal
         if (FLAGS.get("astar_nav", False) and self.world is not None
                 and not self.evading
+                and not is_arc_step
                 and t >= self.unstick_until
                 and math.hypot(goal[0] - x, goal[1] - y) > 10.0):
             if self.world.nav_line_clear((x, y), goal):
@@ -1551,12 +1612,13 @@ class Bot:
 
         yaw = math.atan2(steer_target[1] - y, steer_target[0] - x)
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.
+        reserve_e = 38.0 if (w6_end and zone["next_radius"] <= 35.0) else ENERGY_RESERVE
         if FLAGS.get("energy_mgmt", True):
             urgent_boost = (not me["in_zone"]) or self.late or (self.evading and kite_boost) or cover_boost or drop_boost
-            non_urgent_boost = (not self.evading) and kite_boost and (me["energy"] >= ENERGY_RESERVE + 15.0)
+            non_urgent_boost = ((not self.evading) and kite_boost and (me["energy"] >= reserve_e + 15.0)) or loot_boost
             boost = urgent_boost or non_urgent_boost
         else:
-            boost = not me["in_zone"] or self.late or kite_boost or cover_boost or drop_boost
+            boost = not me["in_zone"] or self.late or kite_boost or cover_boost or drop_boost or loot_boost
         jump = False
 
         # Stuck against something: sidestep, jump, and jet up for a moment.
@@ -2019,7 +2081,8 @@ class Bot:
                 cost = st.get("energy", 0)
                 if FLAGS.get("energy_mgmt", True):
                     urgent_zap = (target.get("hp", 1400.0) < 180.0 or dist < 25.0 or bool(target.get("charging")))
-                    min_energy = cost if urgent_zap else (cost + ENERGY_RESERVE)
+                    reserve_e = 38.0 if (FLAGS.get("w6_endgame_mastery", True) and obs["zone"]["next_radius"] <= 35.0) else ENERGY_RESERVE
+                    min_energy = cost if urgent_zap else (cost + reserve_e)
                 else:
                     min_energy = cost + LIGHTNING_ENERGY_RESERVE
                 fire[i] = (dist <= st["range"] * 0.95 and w["cooldown"] <= cd_fast
@@ -2058,13 +2121,19 @@ class Bot:
     def rear_guard_yaw(self, obs: mf.Observation, me) -> Optional[float]:
         """Priority yaw for rear-guard awareness: 1. recent damaged bearing, 2. closest seen enemy, 3. near sound."""
         t = obs["t"]
-        if self.threat is not None and t - self.threat[0] <= THREAT_MEMORY_S:
+        w6_esc = FLAGS.get("w6_crossfire_escape", True)
+        has_mech_threat = w6_esc and (
+            any(m.get("kind") == "mech" for m in obs["mechs"])
+            or any(aid < 16 for aid in self.seen)
+        )
+        if (self.threat is not None and t - self.threat[0] <= THREAT_MEMORY_S
+                and not (has_mech_threat and self.threat_id is not None and int(self.threat_id) >= 100)):
             return float(self.threat[1])
         mx, my = me["pos"][0], me["pos"][1]
         best_d = 220.0
         best_yaw: Optional[float] = None
         for aid, (_, spos, _) in self.seen.items():
-            if aid < 16 or aid in self.aggressors:
+            if aid < 16 or (aid in self.aggressors and not has_mech_threat):
                 d = math.hypot(spos[0] - mx, spos[1] - my)
                 if 0.1 < d <= best_d:
                     best_d = d
