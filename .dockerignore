@@ -2,5 +2,7 @@
 kit
 tests
 scripts
+tools
 **/__pycache__
 *.md
+

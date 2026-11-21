@@ -3,4 +3,7 @@ __pycache__/
 .DS_Store
 /tmp/
 /kit/
+/tools/
+/scripts/dev.sh
+
 
