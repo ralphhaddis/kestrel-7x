@@ -23,7 +23,9 @@ FLAGS = {
     "cover": True,            # seek cover when inside the zone and threatened
     "los_gate": True,         # gate fire[i] on world.has_los(src, tp)
     "heal": True,             # HEAL_COVER ceasefire when low HP
-    "kite": True,             # perimeter settle + open-field kiting
+    # KEEP kite=False: enabling kite overrides reachable weapon pickups (loot_goal) when an enemy is
+    # within 85 m at full HP, widens early settle radius (50% -> 60%), and costs ~1.94 pts in ablation.
+    "kite": False,            # perimeter settle + open-field kiting (disabled: see movement() notes)
     "cubes": True,            # 20 m cube-seeking
     "sound": True,            # face recent "near" sounds in idle_aim
     "proactive_cover": True,  # seek cover proactively (healing, outnumbered, charging laser, reloading)
@@ -307,7 +309,9 @@ class Bot:
         return self.cover_goal
 
     def choose_kite(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Tuple[Optional[Tuple[float, float]], float]:
-        """Open-field kiting when FLAGS['kite'] is enabled, no building cover is available, and a threat has LOS."""
+        """Open-field kiting when FLAGS['kite'] is enabled, no building cover is available, and a threat has LOS.
+        NOTE: Keep FLAGS['kite'] = False unless decoupled from settle radius and evaluated lower than loot_goal,
+        otherwise a single exposed enemy within 85 m aborts secondary weapon pickups at full HP."""
         if not (FLAGS.get("kite", False) and self.world is not None and me["in_zone"]):
             return None, math.inf
         x, y, z = me["pos"]
@@ -435,6 +439,8 @@ class Bot:
         cx, cy = zone["next_center"]
         d = math.hypot(cx - x, cy - y)
         inner = zone["next_radius"] * 0.8     # comfortably inside the next circle
+        # NOTE: Do not widen settle to 0.60 * next_radius by default (coupled to FLAGS['kite']);
+        # standing still at 60% instead of rotating to 50% early hurt placement (e.g. seed 47).
         if FLAGS.get("kite", False) and zone["next_radius"] > 100.0 and obs.get("alive", 16) > 4:
             settle = max(zone["next_radius"] * 0.60, 3.0)
         else:
