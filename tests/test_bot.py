@@ -2339,6 +2339,51 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
+    def test_w12_bullet_evade_and_charging_priority(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w12_bullet_evade=True, cover=False, fight=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=80.0)
+            o["t"] = 30.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+
+            # 1. Incoming gun bullet aimed directly at us from west triggers perpendicular sidestep without setting evading
+            o["projectiles"] = [
+                {"id": 901, "kind": "gun", "owner": 5, "pos": [x - 80.0, y, z + 4.0], "vel": [252.0, 0.0, 0.0]}
+            ]
+            am = bot.movement(o, o["self"])
+            self.assertFalse(bot.evading, "Bullet dodge must NOT set evading (must not drop laser charge)")
+            self.assertGreater(abs(am["move"][1]), 0.8, "Should sidestep perpendicular (N/S) to eastbound bullet")
+            self.assertFalse(am["boost"], "Bullet dodge should not waste boost")
+
+            # 2. Charging laser enemy gets 0.75x priority even when holding gun-only
+            e_near = enemy(2, (x + 60.0, y, z))
+            e_ch = enemy(3, (x - 75.0, y, z))
+            e_ch["charging"] = True
+            o["mechs"] = [e_near, e_ch]
+            o["projectiles"] = []
+            tgt = bot.pick_target(o, o["self"])
+            self.assertEqual(tgt["id"], 3, "Should prioritize charging laser enemy at 75m (56.25) over 60m gun enemy")
+
+            # 3. Full-mag idle reload when no enemies in obs or seen
+            o["mechs"] = []
+            bot.seen.clear()
+            o["self"]["weapons"][0]["ammo"] = 10
+            ac = bot.combat(o, o["self"])
+            self.assertTrue(ac.get("reload"), "Should top up magazine when completely out of combat")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,7 +53,8 @@ FLAGS = {
     "w7_squad_survival": True, # W7-1: tree-canopy stealth concealment + 1v2+ proactive squad cover + 4-cube crate farm + mid-sound pre-aim
     "w8_kill_conversion": True, # W8-1: strict focus-fire execute (<35% HP), aggressive chase-to-finish on wounded 1v1 (<45% HP), & aggressive cube/weapon pickup
     "w9_squad_hunter": False, # W9-2: unarmed patrol & 1v1 rush (-0.14 official: 3.95 vs 4.09; keep False)
-    "w11_combat_juke": True,  # W11-1: alternating 0.45s lateral gun-dodge juke on post-hit strafe + safe 135m/12s supply drop capture
+    "w11_combat_juke": False, # W11-1: 135m supply drop chase (4.00 vs 4.09; keep False, fold 0.45s juke into w12)
+    "w12_bullet_evade": True, # W12-1: exact incoming gun/NPC bullet sidestep (no laser-drop) + low-HP cover-regen hold + charging-laser priority + full-mag idle reload + 1v2 cover
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -647,7 +648,15 @@ class Bot:
             proactive = self.healing or reloading or enemy_charging or len(vis_enemies) >= 2
         elif FLAGS.get("w7_squad_survival", True):
             vis_enemies = [m for m in obs["mechs"] if m.get("kind") == "mech"]
-            proactive = len(vis_enemies) >= 2 and me["hp"] < 0.85 * me["max_hp"]
+            if FLAGS.get("w12_bullet_evade", True):
+                near_vis = [m for m in vis_enemies if math.hypot(m["pos"][0] - x, m["pos"][1] - y) <= 150.0]
+                if len(near_vis) >= 2:
+                    min_ef = min(m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)) for m in near_vis)
+                    proactive = (me["hp"] < 0.96 * me["max_hp"]) and not (min_ef < 0.28 and me["hp"] > 0.45 * me["max_hp"])
+                else:
+                    proactive = len(vis_enemies) >= 2 and me["hp"] < 0.85 * me["max_hp"]
+            else:
+                proactive = len(vis_enemies) >= 2 and me["hp"] < 0.85 * me["max_hp"]
 
         if not (recent_hit or pursuing or proactive):
             self.cover_goal = None
@@ -1145,6 +1154,73 @@ class Bot:
         should_boost = bool(me.get("grounded", True)) and (me["energy"] > 15.0) and (imminent_mortar or tight_laser)
         return best_pt, should_boost
 
+    def choose_bullet_dodge(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Optional[Tuple[float, float]]:
+        """Sidestep imminent incoming gun/NPC projectiles perpendicular to flight vector without dropping laser charge."""
+        if not (FLAGS.get("w12_bullet_evade", True) and me["in_zone"] and inner > 3.0):
+            return None
+        projs = obs.get("projectiles", ())
+        if not projs:
+            return None
+        x, y, z = me["pos"]
+        st = me["stats"]
+        mr = st.get("radius", self.mech_r)
+        mh = st.get("height", self.mech_h)
+        me_center = (x, y, z + mh * 0.5)
+
+        has_mech_t = (
+            any(m.get("kind") == "mech" for m in obs["mechs"])
+            or any(aid < 16 for aid in self.seen)
+        )
+        soonest = None
+        best_tc = 0.72
+        for p in projs:
+            pk = p.get("kind")
+            if pk not in ("gun", "npc") or p.get("owner") == me["id"]:
+                continue
+            if pk == "npc" and has_mech_t:
+                continue
+            px, py, pz = p["pos"]
+            vx, vy, vz = p["vel"]
+            v2 = vx * vx + vy * vy
+            if v2 < 100.0:
+                continue
+            tc = ((x - px) * vx + (y - py) * vy) / v2
+            if tc < 0.03 or tc >= best_tc:
+                continue
+            cx_p = px + vx * tc
+            cy_p = py + vy * tc
+            cz_p = pz + vz * tc
+            if math.hypot(x - cx_p, y - cy_p) > mr + 1.5:
+                continue
+            if not (z - 0.8 <= cz_p <= z + mh + 0.8):
+                continue
+            if self.world is not None and not self.world.has_los((px, py, pz), me_center):
+                continue
+            best_tc = tc
+            soonest = (vx, vy, cx_p, cy_p, math.sqrt(v2))
+
+        if soonest is None:
+            return None
+        vx, vy, cx_p, cy_p, v_xy = soonest
+        lx, ly = -vy / v_xy, vx / v_xy
+        dot = (x - cx_p) * lx + (y - cy_p) * ly
+        if abs(dot) < 0.6:
+            pref = 1.0 if self.unstick_side >= 0 else -1.0
+        else:
+            pref = 1.0 if dot >= 0.0 else -1.0
+        for side in (pref, -pref):
+            sx = x + 8.0 * side * lx
+            sy = y + 8.0 * side * ly
+            if math.hypot(sx - cx, sy - cy) > inner:
+                continue
+            if self.world is not None:
+                sz = self.world.support_z(sx, sy, z)
+                if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
+                        and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
+                    continue
+            return (sx, sy)
+        return None
+
     def choose_crate(self, obs: mf.Observation, me, cx: float, cy: float, inner: float) -> Optional[dict]:
         """Select a nearby ground crate to farm when zero enemies are around."""
         if not (FLAGS.get("farm_crate", True) and me["in_zone"] and not self.late
@@ -1406,12 +1482,12 @@ class Bot:
                 cover = self.choose_cover(obs, me, cx, cy, inner)
                 if cover is not None:
                     dist_c = math.hypot(cover[0] - x, cover[1] - y)
-                    if (w9_sh and self.cover_goal is not None
+                    if ((w9_sh or FLAGS.get("w12_bullet_evade", True)) and self.cover_goal is not None
                             and not self.cover_exposed
-                            and me["hp"] < 0.55 * me["max_hp"]
+                            and me["hp"] < (0.72 if FLAGS.get("w12_bullet_evade", True) else 0.55) * me["max_hp"]
                             and (t - self.last_damaged_t) >= 0.8
-                            and not any(m.get("kind") == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 38.0 for m in obs["mechs"])):
-                        # Behind cover with low HP (< 55%): extend cover_until so we stay behind the wall
+                            and not any(m.get("kind") == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 32.0 for m in obs["mechs"])):
+                        # Behind cover with low HP: extend cover_until so we stay behind the wall
                         # long enough to trigger 5s out-of-combat HP regeneration (+45..72 HP/s)!
                         self.cover_until = max(self.cover_until, t + 1.5)
                     if dist_c <= COVER_REACH_M and (not self.cover_exposed or (w4c and self.cover_goal_exposed)):
@@ -1437,7 +1513,7 @@ class Bot:
                                         or any(aid < 16 for aid in self.seen)))):
                         # Post-hit strafe / pinch escape / anti-rusher backpedal when no cover building is nearby.
                         bearing = self.threat[1]
-                        if (FLAGS.get("combat_strafe", False) or FLAGS.get("w11_combat_juke", True)) and t >= self.strafe_flip_t:
+                        if (FLAGS.get("combat_strafe", False) or FLAGS.get("w11_combat_juke", False) or FLAGS.get("w12_bullet_evade", True)) and t >= self.strafe_flip_t:
                             self.unstick_side = -self.unstick_side
                             self.strafe_flip_t = t + 0.45
                         arc_goal = None
@@ -1502,24 +1578,33 @@ class Bot:
                             goal = arc_goal
                             is_arc_step = True
                         else:
-                            dx, dy = -math.sin(bearing), math.cos(bearing)
-                            if self.unstick_side < 0:
-                                dx, dy = -dx, -dy
-                            if inner > 3:
-                                if self.world is not None:
-                                    mr, mh = me["stats"].get("radius"), me["stats"].get("height")
-                                    sx, sy = x + 8.0 * dx, y + 8.0 * dy
-                                    sz = self.world.support_z(sx, sy, me["pos"][2])
-                                    if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
-                                            and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
-                                        dx, dy = -dx, -dy
-                                        self.unstick_side = -self.unstick_side
-                                goal = (x + dx, y + dy)
+                            bullet_goal = self.choose_bullet_dodge(obs, me, cx, cy, inner)
+                            if bullet_goal is not None:
+                                goal = bullet_goal
+                                is_arc_step = True
                             else:
-                                goal = (cx, cy)
+                                dx, dy = -math.sin(bearing), math.cos(bearing)
+                                if self.unstick_side < 0:
+                                    dx, dy = -dx, -dy
+                                if inner > 3:
+                                    if self.world is not None:
+                                        mr, mh = me["stats"].get("radius"), me["stats"].get("height")
+                                        sx, sy = x + 8.0 * dx, y + 8.0 * dy
+                                        sz = self.world.support_z(sx, sy, me["pos"][2])
+                                        if not (self.world.is_walkable(sx, sy, sz, radius=mr, height=mh)
+                                                and self.world.path_clear(me["pos"], (sx, sy, sz), radius=mr, height=mh)):
+                                            dx, dy = -dx, -dy
+                                            self.unstick_side = -self.unstick_side
+                                    goal = (x + dx, y + dy)
+                                else:
+                                    goal = (cx, cy)
                     else:
-                        strafe_goal, strafe_boost = self.choose_combat_strafe(obs, me, cx, cy, inner)
-                        if strafe_goal is not None:
+                        bullet_goal = self.choose_bullet_dodge(obs, me, cx, cy, inner)
+                        strafe_goal, strafe_boost = (None, False) if bullet_goal is not None else self.choose_combat_strafe(obs, me, cx, cy, inner)
+                        if bullet_goal is not None:
+                            goal = bullet_goal
+                            is_arc_step = True
+                        elif strafe_goal is not None:
                             goal = strafe_goal
                             kite_boost = strafe_boost
                         elif drop_pick is not None:
@@ -1791,6 +1876,7 @@ class Bot:
         src = (mx, my, mz + me["stats"]["muzzle_height"])
         use_tri = FLAGS.get("weapon_tri", True)
         my_kinds = {w["kind"] for w in me["weapons"] if w} if use_tri else ()
+        max_w_range = max((w["stats"].get("range", 0.0) for w in me["weapons"] if w), default=0.0)
         agg_drops = FLAGS.get("aggressive_drops", True)
         farm_npc_id = (
             self.npc_farm_target["id"]
@@ -1824,6 +1910,8 @@ class Bot:
                         s *= 0.75
                     if "mortar" in my_kinds and "laser" in ew and m.get("charging"):
                         s *= 0.80
+                    if FLAGS.get("w12_bullet_evade", True) and m.get("charging") and dist <= min(self.laser_range, max_w_range):
+                        s *= 0.75
                 if agg_drops and self.active_drop_holder is not None and m["id"] == self.active_drop_holder:
                     s *= 0.55
             if s >= best_s:
@@ -2101,8 +2189,19 @@ class Bot:
 
             aim = self.idle_aim(obs, me)
             out = {"aim": aim, "fire": fire}
-            if gun and gun.get("reload", 0) == 0 and gun.get("ammo", 0) < gun["stats"]["mag"] * 0.5:
-                out["reload"] = True  # top up while nobody is around
+            if gun and gun.get("reload", 0) == 0:
+                mag = gun["stats"]["mag"]
+                ammo = gun.get("ammo", 0)
+                t_idle = obs["t"]
+                calm_reload = (
+                    FLAGS.get("w12_bullet_evade", True)
+                    and ammo < mag
+                    and not any(aid < 16 for aid in self.seen)
+                    and (self.threat is None or t_idle - self.threat[0] >= THREAT_MEMORY_S)
+                    and (self.last_near_sound is None or t_idle - self.last_near_sound[0] > 2.5)
+                )
+                if ammo < mag * 0.5 or calm_reload:
+                    out["reload"] = True  # top up while nobody is around
             self.draw(me, None, "idle")
             return out
 
