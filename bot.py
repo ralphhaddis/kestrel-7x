@@ -54,7 +54,8 @@ FLAGS = {
     "w8_kill_conversion": True, # W8-1: strict focus-fire execute (<35% HP), aggressive chase-to-finish on wounded 1v1 (<45% HP), & aggressive cube/weapon pickup
     "w9_squad_hunter": False, # W9-2: unarmed patrol & 1v1 rush (-0.14 official: 3.95 vs 4.09; keep False)
     "w11_combat_juke": False, # W11-1: 135m supply drop chase (4.00 vs 4.09; keep False, fold 0.45s juke into w12)
-    "w12_bullet_evade": True, # W12-1: exact incoming gun/NPC bullet sidestep (no laser-drop) + low-HP cover-regen hold + charging-laser priority + full-mag idle reload + 1v2 cover
+    "w12_bullet_evade": False, # W12-1: bullet sidestep + cover-regen hold (3.93 vs 4.09; keep False)
+    "w13_squad_endurance": True, # W13-1: distant-enemy-safe weapon hunt (>65m, pickup >50m from enemies), small-zone lightning swap (30m), gun_damage/rate upgrade priority
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -308,14 +309,15 @@ class Bot:
             if FLAGS.get("w4_combat", True):
                 nanites_stacks = sum(1 for u in obs["self"].get("upgrades", ()) if u == "nanites")
                 alive = obs.get("alive", 16)
+                w13_se = FLAGS.get("w13_squad_endurance", True)
                 held_weapon_scores = {
-                    "laser_damage": 86,
-                    "laser_charge": 85,
-                    "gun_mag": 84,
+                    "laser_damage": 87 if w13_se else 86,
+                    "laser_charge": 86 if w13_se else 85,
+                    "gun_damage": 85 if w13_se else 80,
+                    "gun_rate": 84 if w13_se else 74,
                     "lightning_range": 83,
-                    "gun_damage": 80,
-                    "lightning_efficiency": 77,
-                    "gun_rate": 74,
+                    "gun_mag": 81 if w13_se else 84,
+                    "lightning_efficiency": 78 if w13_se else 77,
                     "mortar_reload": 72,
                     "mortar_splash": 70,
                     "gun_velocity": 68,
@@ -474,7 +476,11 @@ class Bot:
                 max_swap_d = (
                     35.0
                     if (use_lf and pk == "laser" and zone["next_radius"] > 70.0 and not vis_enemies and not active_combat)
-                    else base_swap_d
+                    else (
+                        30.0
+                        if (FLAGS.get("w13_squad_endurance", True) and use_lf and pk == "lightning" and zone["next_radius"] <= 70.0 and not vis_enemies and not active_combat)
+                        else base_swap_d
+                    )
                 )
                 if d > max_swap_d:
                     continue
@@ -553,14 +559,28 @@ class Bot:
                     if lf_safe_detour is None:
                         t_now = obs["t"]
                         hp_need = 0.65 if w8_kc else 0.85
+                        w13_se = FLAGS.get("w13_squad_endurance", True)
+                        near_enemy_detour = (
+                            any(
+                                m["kind"] == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) <= 65.0
+                                for m in obs["mechs"]
+                            )
+                            if w13_se
+                            else any(m["kind"] == "mech" for m in obs["mechs"])
+                        )
                         lf_safe_detour = (
                             me["in_zone"]
                             and not self.late
                             and me["hp"] >= hp_need * me["max_hp"]
-                            and not any(m["kind"] == "mech" for m in obs["mechs"])
+                            and not near_enemy_detour
                             and (self.threat is None or t_now - self.threat[0] >= THREAT_MEMORY_S)
                         )
                     if not lf_safe_detour:
+                        continue
+                    if FLAGS.get("w13_squad_endurance", True) and any(
+                        m["kind"] == "mech" and math.hypot(m["pos"][0] - px, m["pos"][1] - py) <= 50.0
+                        for m in obs["mechs"]
+                    ):
                         continue
                 if (early_w or use_lf) and self.world is not None:
                     # Check pickup height against its own local terrain floor (fixes hill rejection bug)

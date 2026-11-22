@@ -1723,6 +1723,7 @@ class Decisions(unittest.TestCase):
         old = dict(B.FLAGS)
         B.FLAGS["smart_upgrades"] = True
         B.FLAGS["w4_combat"] = True
+        B.FLAGS["w13_squad_endurance"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs()
@@ -1792,6 +1793,7 @@ class Decisions(unittest.TestCase):
         B.FLAGS["laser_first"] = True
         B.FLAGS["early_weapon"] = False
         B.FLAGS["w8_kill_conversion"] = False
+        B.FLAGS["w13_squad_endurance"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
