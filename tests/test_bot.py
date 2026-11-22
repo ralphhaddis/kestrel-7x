@@ -1271,6 +1271,7 @@ class Decisions(unittest.TestCase):
         old = dict(B.FLAGS)
         B.FLAGS["drops"] = True
         B.FLAGS["aggressive_drops"] = False
+        B.FLAGS["w11_combat_juke"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400, max_hp=1400)

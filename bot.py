@@ -52,7 +52,8 @@ FLAGS = {
     "w6_endgame_mastery": True, # W6-3: energy reserve & tight center control in final circles (next_radius <= 35m)
     "w7_squad_survival": True, # W7-1: tree-canopy stealth concealment + 1v2+ proactive squad cover + 4-cube crate farm + mid-sound pre-aim
     "w8_kill_conversion": True, # W8-1: strict focus-fire execute (<35% HP), aggressive chase-to-finish on wounded 1v1 (<45% HP), & aggressive cube/weapon pickup
-    "w9_squad_hunter": True,  # W9-2: gun+lightning/laser combat mastery, active unarmed patrol, bullet-dodge strafe, & aggressive 1v1 ambush/finish
+    "w9_squad_hunter": False, # W9-2: unarmed patrol & 1v1 rush (-0.14 official: 3.95 vs 4.09; keep False)
+    "w11_combat_juke": True,  # W11-1: alternating 0.45s lateral gun-dodge juke on post-hit strafe + safe 135m/12s supply drop capture
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -1253,7 +1254,10 @@ class Bot:
                     if rem_cap <= eta_boost + 0.3:
                         continue
             else:
-                if dist >= best_d or dist > 85.0 or lands_in > 8.0:
+                w11_j = FLAGS.get("w11_combat_juke", True)
+                max_dr_d = 135.0 if w11_j else 85.0
+                max_dr_t = 12.0 if w11_j else 8.0
+                if dist >= best_d or dist > max_dr_d or lands_in > max_dr_t:
                     continue
                 if math.hypot(dx - cx, dy - cy) > inner:
                     continue
@@ -1354,7 +1358,7 @@ class Bot:
         w6_loot = FLAGS.get("w6_loot_hunt", True)
         w6_end = FLAGS.get("w6_endgame_mastery", True)
         w8_kc = FLAGS.get("w8_kill_conversion", True)
-        w9_sh = FLAGS.get("w9_squad_hunter", True)
+        w9_sh = FLAGS.get("w9_squad_hunter", False)
         if w6_end and zone["next_radius"] <= 35.0:
             settle = max(zone["next_radius"] * 0.32, 2.0)
         agg_drops = FLAGS.get("aggressive_drops", True)
@@ -1433,9 +1437,9 @@ class Bot:
                                         or any(aid < 16 for aid in self.seen)))):
                         # Post-hit strafe / pinch escape / anti-rusher backpedal when no cover building is nearby.
                         bearing = self.threat[1]
-                        if FLAGS.get("combat_strafe", False) and t >= self.strafe_flip_t:
+                        if (FLAGS.get("combat_strafe", False) or FLAGS.get("w11_combat_juke", True)) and t >= self.strafe_flip_t:
                             self.unstick_side = -self.unstick_side
-                            self.strafe_flip_t = t + 0.55
+                            self.strafe_flip_t = t + 0.45
                         arc_goal = None
                         if w4c and inner > 3:
                             arc_pts = [
@@ -2114,7 +2118,7 @@ class Bot:
         if self.healing:
             if not ((has_los and dist <= 35.0) or (obs["t"] - self.last_damaged_t) <= 0.5):
                 ceasefire = True
-        elif (FLAGS.get("w9_squad_hunter", True) and not self.evading and self.cover_goal is not None
+        elif (FLAGS.get("w9_squad_hunter", False) and not self.evading and self.cover_goal is not None
               and not self.cover_exposed and me["hp"] < 0.55 * me["max_hp"]
               and (obs["t"] - self.last_damaged_t) >= 0.8
               and target.get("hp", 1400.0) > 250.0 and dist > 38.0):
