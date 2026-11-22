@@ -52,6 +52,7 @@ FLAGS = {
     "w6_endgame_mastery": True, # W6-3: energy reserve & tight center control in final circles (next_radius <= 35m)
     "w7_squad_survival": True, # W7-1: tree-canopy stealth concealment + 1v2+ proactive squad cover + 4-cube crate farm + mid-sound pre-aim
     "w8_kill_conversion": True, # W8-1: strict focus-fire execute (<35% HP), aggressive chase-to-finish on wounded 1v1 (<45% HP), & aggressive cube/weapon pickup
+    "w9_high_ground": True,   # W9-1: 3D jetpack rooftop high-ground fortress + rooftop peek-and-regen + rooftop weapon/crate access + mid-fight regen discipline
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -175,6 +176,10 @@ class Bot:
         self.laser_no_los_s: float = 0.0
         self.bad_waypoints: Dict[Tuple[int, int], float] = {}      # (wx_cell, wy_cell) -> expires_t
         self.last_wp_pop_t: float = -99.0
+        self.roof_target: Optional[Tuple[float, float, float, float, float, float]] = None
+        self.roof_climb_until: float = -1.0
+        self.patrol_angle: float = self.rng.uniform(0.0, TAU)
+        self.patrol_until: float = -1.0
         mf.log(f"{self.name}: slot {hello['slot']} seed {hello['seed']}")
 
     # ------------------------------------------------------------------ main step
@@ -699,7 +704,12 @@ class Bot:
 
         base_angle = math.atan2(cy - y, cx - x)
         w6_esc = FLAGS.get("w6_crossfire_escape", True)
-        radii = (12.0, 24.0, 36.0, 48.0) if (FLAGS.get("proactive_cover", False) or w6_esc) else (12.0, 24.0, 36.0)
+        w9_hg = FLAGS.get("w9_high_ground", True)
+        on_roof_cov = w9_hg and (z - self.world.ground_z(x, y)) >= 5.0
+        if on_roof_cov:
+            radii = (4.0, 8.0, 12.0, 18.0)
+        else:
+            radii = (12.0, 24.0, 36.0, 48.0) if (FLAGS.get("proactive_cover", False) or w6_esc) else (12.0, 24.0, 36.0)
         n_exposed = len(exposed_threats)
         n_unexposed = len(unexposed_threats)
         n_threats = n_exposed + n_unexposed
@@ -718,6 +728,8 @@ class Bot:
                 if max_possible <= best_score:
                     return
                 pz = self.world.support_z(px, py, z)
+                if on_roof_cov and (z - pz) > 2.0:
+                    return
                 if not self.world.is_walkable(px, py, pz, radius=mr, height=mh):
                     return
                 cand_eye = (px, py, pz + eye_h)
@@ -758,7 +770,7 @@ class Bot:
                 best_pos = (px, py)
                 best_partial = False
 
-        if FLAGS.get("corner_cover", True):
+        if FLAGS.get("corner_cover", True) and not on_roof_cov:
             for px, py in self.world.nearby_corners(x, y, max_r=48.0 if w6_esc else 42.0, limit=20):
                 eval_cand(px, py, math.hypot(px - x, py - y))
 
@@ -1351,6 +1363,7 @@ class Bot:
         w6_loot = FLAGS.get("w6_loot_hunt", True)
         w6_end = FLAGS.get("w6_endgame_mastery", True)
         w8_kc = FLAGS.get("w8_kill_conversion", True)
+        w9_hg = FLAGS.get("w9_high_ground", True)
         if w6_end and zone["next_radius"] <= 35.0:
             settle = max(zone["next_radius"] * 0.32, 2.0)
         agg_drops = FLAGS.get("aggressive_drops", True)
@@ -1365,6 +1378,8 @@ class Bot:
         drop_boost = False
         loot_boost = False
         is_arc_step = False
+        roof_jump = False
+        roof_jet = False
         goal = None
         evade_goal, evade_boost = self.choose_evade(obs, me, cx, cy, inner)
         if evade_goal is not None:
@@ -1617,13 +1632,73 @@ class Bot:
                             goal = (cx, cy)
                         elif d > settle:
                             goal = (cx, cy)
-                        elif (FLAGS.get("w7_squad_survival", True)
-                              and self.world is not None
-                              and hasattr(self.world, "nearby_canopies")
-                              and not any(m.get("kind") == "mech" for m in obs["mechs"])
-                              and (any(aid < 16 for aid in self.seen)
-                                   or (self.last_near_sound is not None and t - self.last_near_sound[0] <= 2.5))
-                              and (self.threat is None or t - self.threat[0] >= THREAT_MEMORY_S)):
+                        elif (w9_hg and self.world is not None and hasattr(self.world, "nearby_roofs")
+                              and t >= 15.0 and zone["next_radius"] > 35.0 and me["in_zone"] and not self.late
+                              and me["hp"] >= 0.50 * me["max_hp"]
+                              and not (self.threat is not None and t - self.threat[0] < THREAT_MEMORY_S)):
+                            mz_r = me["pos"][2]
+                            gz_r = self.world.ground_z(x, y)
+                            on_roof = bool(me["grounded"]) and (mz_r - gz_r) >= 5.0
+                            if None in me["weapons"] and not on_roof and t < 150.0 and not any(m.get("kind") == "mech" for m in obs["mechs"]):
+                                # Unarmed (gun-only): actively patrol inside settle radius to discover floor weapons & crates
+                                # instead of standing idle in an empty corner!
+                                pr_p = min(settle * 0.65, max(25.0, zone["next_radius"] * 0.45))
+                                px_p = cx + pr_p * math.cos(self.patrol_angle)
+                                py_p = cy + pr_p * math.sin(self.patrol_angle)
+                                if t >= self.patrol_until or math.hypot(x - px_p, y - py_p) < 18.0:
+                                    self.patrol_angle = wrap(self.patrol_angle + 1.35)
+                                    self.patrol_until = t + 7.0
+                                    px_p = cx + pr_p * math.cos(self.patrol_angle)
+                                    py_p = cy + pr_p * math.sin(self.patrol_angle)
+                                goal = (px_p, py_p)
+                            elif not on_roof and None not in me["weapons"]:
+                                # Armed: pick or keep a climbable rooftop inside `settle` (<= 85 m away)
+                                rt = self.roof_target
+                                if rt is not None:
+                                    rx, ry, rtop, lx, ly, lgz = rt
+                                    if math.hypot(rx - cx, ry - cy) > settle or math.hypot(lx - x, ly - y) > 105.0:
+                                        rt = None
+                                if rt is None:
+                                    cands = self.world.nearby_roofs(x, y, cx, cy, max_center_r=settle, max_dist=85.0)
+                                    if cands:
+                                        rt = cands[0]
+                                self.roof_target = rt
+                                if rt is not None:
+                                    rx, ry, rtop, lx, ly, lgz = rt
+                                    d_launch = math.hypot(lx - x, ly - y)
+                                    d_roof = math.hypot(rx - x, ry - y)
+                                    climb_h = max(0.0, rtop - mz_r)
+                                    # Energy required to jet climb_h meters at ~10 m/s, 15 energy/s = 1.5 * climb_h + margin
+                                    e_need = climb_h * 1.65 + 14.0
+                                    if me["grounded"] and d_launch > 5.5:
+                                        self.roof_climb_until = -1.0
+                                    if d_launch <= 5.5 or (not me["grounded"] and t < self.roof_climb_until):
+                                        if me["grounded"] and me["energy"] >= e_need:
+                                            self.roof_climb_until = t + max(1.2, climb_h / 7.5 + 0.8)
+                                            roof_jump = True
+                                            goal = (rx, ry)
+                                            is_arc_step = True
+                                        elif not me["grounded"] and mz_r < rtop + 0.6 and me["energy"] > 4.0:
+                                            roof_jet = True
+                                            goal = (rx, ry)
+                                            is_arc_step = True
+                                        elif not me["grounded"] and mz_r >= rtop + 0.6:
+                                            # Cleared roof edge: glide straight onto (rx, ry)
+                                            goal = (rx, ry)
+                                            is_arc_step = True
+                                        elif me["grounded"] and d_launch <= 5.5:
+                                            # Recharge energy right at the launch point before jumping
+                                            goal = None
+                                    elif d_roof > 5.0:
+                                        goal = (lx, ly)
+                        if (goal is None and not roof_jump and not roof_jet
+                                and FLAGS.get("w7_squad_survival", True)
+                                and self.world is not None
+                                and hasattr(self.world, "nearby_canopies")
+                                and not any(m.get("kind") == "mech" for m in obs["mechs"])
+                                and (any(aid < 16 for aid in self.seen)
+                                     or (self.last_near_sound is not None and t - self.last_near_sound[0] <= 2.5))
+                                and (self.threat is None or t - self.threat[0] >= THREAT_MEMORY_S)):
                             mr_c, mh_c = me["stats"].get("radius"), me["stats"].get("height")
                             mz_c = me["pos"][2]
                             for cnx, cny in self.world.nearby_canopies(x, y, max_r=22.0, limit=4):
@@ -1704,12 +1779,12 @@ class Bot:
         # Boost when outside the zone, or when walking won't get us inside before the shrink ends.
         reserve_e = 38.0 if (w6_end and zone["next_radius"] <= 35.0) else ENERGY_RESERVE
         if FLAGS.get("energy_mgmt", True):
-            urgent_boost = (not me["in_zone"]) or self.late or (self.evading and kite_boost) or cover_boost or drop_boost
+            urgent_boost = (not me["in_zone"]) or self.late or (self.evading and kite_boost) or cover_boost or drop_boost or roof_jet
             non_urgent_boost = ((not self.evading) and kite_boost and (me["energy"] >= reserve_e + 15.0)) or loot_boost
             boost = urgent_boost or non_urgent_boost
         else:
-            boost = not me["in_zone"] or self.late or kite_boost or cover_boost or drop_boost or loot_boost
-        jump = False
+            boost = not me["in_zone"] or self.late or kite_boost or cover_boost or drop_boost or loot_boost or roof_jet
+        jump = roof_jump
 
         # Stuck against something: sidestep, jump, and jet up for a moment.
         if me["grounded"] and math.hypot(me["vel"][0], me["vel"][1]) < STUCK_SPEED:
@@ -1720,7 +1795,7 @@ class Bot:
             self.unstick_until = t + UNSTICK_S
             self.unstick_side = -self.unstick_side
             self.stuck_s = 0.0
-        if t < self.unstick_until:
+        if t < self.unstick_until and not (roof_jump or roof_jet):
             yaw += self.unstick_side * 1.1
             jump = me["grounded"]
             boost = boost or (not me["grounded"] and me["energy"] > 10)

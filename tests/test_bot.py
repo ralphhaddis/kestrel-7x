@@ -1934,6 +1934,7 @@ class Decisions(unittest.TestCase):
         old = dict(B.FLAGS)
         B.FLAGS["early_survival"] = True
         B.FLAGS["kite"] = False
+        B.FLAGS["w9_high_ground"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True)
@@ -2284,6 +2285,46 @@ class Decisions(unittest.TestCase):
             bot.update_memory(o)
             am_mem = bot.movement(o, o["self"])
             self.assertLess(am_mem["move"][0], -0.8, "Should chase last seen position of single wounded enemy")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w9_high_ground_multi_tick_rooftop_climb(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w9_high_ground=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            self.assertGreater(len(bot.world.roof_nodes), 20, "WorldMap should index climbable rooftops")
+            rx, ry, rtop, lx, ly, lgz = bot.world.roof_nodes[0]
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=100.0, grounded=True)
+            o["t"] = 25.0
+            o["self"]["pos"] = [lx, ly, lgz]
+            l_st = dict(HELLO["config"]["weapons"]["laser"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": l_st},
+            ]
+            o["zone"].update(center=[rx, ry], radius=400.0, next_center=[rx, ry], next_radius=200.0)
+            o["mechs"] = []
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+
+            # Tick 1: at launch point on ground -> jumps toward roof
+            bot.update_memory(o)
+            a1 = bot.movement(o, o["self"])
+            self.assertTrue(a1["jump"], "Should jump from roof launch point")
+            self.assertFalse(a1["boost"], "Should not double-drain boost on grounded jump tick")
+
+            # Tick 2: airborne at +6.0m above ground (still below rtop) -> must keep jetting (boost=True)!
+            o["t"] = 25.5
+            o["self"]["grounded"] = False
+            o["self"]["pos"] = [lx, ly, lgz + 6.0]
+            bot.update_memory(o)
+            a2 = bot.movement(o, o["self"])
+            self.assertTrue(a2["boost"], "Must keep jetting upward when airborne >5m above ground and below rtop")
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
