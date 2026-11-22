@@ -50,7 +50,8 @@ FLAGS = {
     "w6_crossfire_escape": True, # W6-1: radial 48m cover fallback + boosted pinch escape + anti-rusher backpedal + NPC-fire dodge
     "w6_loot_hunt": True,     # W6-2: safe 62m lightning & 85m unboosted laser detour when slot 1 is empty and zero enemies visible
     "w6_endgame_mastery": True, # W6-3: energy reserve & tight center control in final circles (next_radius <= 35m)
-    "w7_squad_survival": True, # W7-1: tree-canopy stealth settle + proactive charging-laser cover + mid-sound pre-aim + multi-cube crate farming
+    "w7_squad_survival": True, # W7-1: tree-canopy stealth concealment + 1v2+ proactive squad cover + 4-cube crate farm + mid-sound pre-aim
+    "w8_kill_conversion": True, # W8-1: strict focus-fire execute (<35% HP), aggressive chase-to-finish on wounded 1v1 (<45% HP), & aggressive cube/weapon pickup
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
     "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
@@ -116,6 +117,7 @@ class Bot:
 
         self.world = wm.WorldMap.load(hello)
         self.seen = {}          # actor id -> (t, pos, vel), last time we saw it
+        self.seen_hp = {}       # actor id -> (t, hp_frac), last known HP fraction
         self.bad_pickups = {}   # pickup id -> t_expire blacklist
         self.crate_target = None
         self.bad_crates = {}    # crate id -> t_expire blacklist
@@ -194,6 +196,8 @@ class Bot:
         self.last_t = t
         for m in obs["mechs"]:
             self.seen[m["id"]] = (t, m["pos"], m["vel"])
+            if m.get("kind") == "mech":
+                self.seen_hp[m["id"]] = (t, m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)))
         for e in obs["events"]:
             if e.get("type") == "damaged":
                 self.last_damaged_t = t
@@ -213,6 +217,7 @@ class Bot:
             if e.get("type") == "kill":
                 target = e["target"]
                 self.seen.pop(target, None)
+                self.seen_hp.pop(target, None)
                 self.aggressors.pop(target, None)
                 if target == self.threat_id:
                     self.threat = None
@@ -227,6 +232,7 @@ class Bot:
                     self.bad_pickups[pid] = t + 15.0
         cutoff = t - self.memory_s
         self.seen = {k: v for k, v in self.seen.items() if v[0] >= cutoff}
+        self.seen_hp = {k: v for k, v in self.seen_hp.items() if v[0] >= cutoff}
         self.aggressors = {k: v for k, v in self.aggressors.items() if v >= t - AGGRO_MEMORY_S}
         self.bad_pickups = {k: v for k, v in self.bad_pickups.items() if v > t}
         self.bad_crates = {k: v for k, v in self.bad_crates.items() if v > t}
@@ -492,7 +498,8 @@ class Bot:
 
         early_w = FLAGS.get("early_weapon", False)
         w6_loot = FLAGS.get("w6_loot_hunt", True)
-        max_detour = 85.0 if early_w else (85.0 if (use_lf and w6_loot) else (75.0 if use_lf else LOOT_DETOUR_M))
+        w8_kc = FLAGS.get("w8_kill_conversion", True)
+        max_detour = 85.0 if early_w else (130.0 if (use_lf and w8_kc) else (85.0 if (use_lf and w6_loot) else (75.0 if use_lf else LOOT_DETOUR_M)))
         st = me["stats"]
         mr, mh = st.get("radius"), st.get("height")
         enemy_has_los: Optional[bool] = None
@@ -512,7 +519,9 @@ class Bot:
                 if d >= max_detour:
                     continue
             else:
-                if use_lf and w6_loot:
+                if use_lf and w8_kc:
+                    kind_max_d = 130.0 if pk == "laser" else (95.0 if pk == "lightning" else LOOT_DETOUR_M)
+                elif use_lf and w6_loot:
                     kind_max_d = 85.0 if pk == "laser" else (62.0 if pk == "lightning" else LOOT_DETOUR_M)
                 else:
                     kind_max_d = 75.0 if (use_lf and pk == "laser") else LOOT_DETOUR_M
@@ -538,10 +547,11 @@ class Bot:
                 elif use_lf and d > LOOT_DETOUR_M:
                     if lf_safe_detour is None:
                         t_now = obs["t"]
+                        hp_need = 0.65 if w8_kc else 0.85
                         lf_safe_detour = (
                             me["in_zone"]
                             and not self.late
-                            and me["hp"] >= 0.85 * me["max_hp"]
+                            and me["hp"] >= hp_need * me["max_hp"]
                             and not any(m["kind"] == "mech" for m in obs["mechs"])
                             and (self.threat is None or t_now - self.threat[0] >= THREAT_MEMORY_S)
                         )
@@ -1141,7 +1151,10 @@ class Bot:
         cubes = me.get("cubes", 0)
         w7_sq = FLAGS.get("w7_squad_survival", True)
         if w7_sq:
-            if not (cubes == 0 or (cubes < 4 and t < 90.0)):
+            if FLAGS.get("w8_kill_conversion", True):
+                if not (cubes == 0 or (cubes < 6 and t < 110.0) or (None in me["weapons"] and cubes < 8)):
+                    return None
+            elif not (cubes == 0 or (cubes < 4 and t < 90.0)):
                 return None
         else:
             if not (cubes == 0 or (None in me["weapons"] and cubes < 2 and t < 90.0)):
@@ -1337,6 +1350,7 @@ class Bot:
         w6_esc = FLAGS.get("w6_crossfire_escape", True)
         w6_loot = FLAGS.get("w6_loot_hunt", True)
         w6_end = FLAGS.get("w6_endgame_mastery", True)
+        w8_kc = FLAGS.get("w8_kill_conversion", True)
         if w6_end and zone["next_radius"] <= 35.0:
             settle = max(zone["next_radius"] * 0.32, 2.0)
         agg_drops = FLAGS.get("aggressive_drops", True)
@@ -1441,9 +1455,17 @@ class Bot:
                                         cover_boost = True
                             elif w6_esc and len(arc_pts) == 1:
                                 # 1v1 close-quarters rusher (< 42 m) when we do not hold lightning: diagonal backpedal
+                                # (Skip backpedaling if w8_kc and enemy is critically low HP and we have HP advantage!)
+                                vis_1v1 = next((m for m in obs["mechs"] if m.get("kind") == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) <= 130.0), None)
+                                enemy_low_1v1 = (
+                                    w8_kc
+                                    and vis_1v1 is not None
+                                    and vis_1v1.get("hp", 1400.0) < 0.45 * vis_1v1.get("max_hp", 1400.0)
+                                    and me["hp"] > max(0.35 * me["max_hp"], vis_1v1.get("hp", 1400.0))
+                                )
                                 held_k = {w["kind"] for w in me["weapons"] if w}
                                 ed_1v1 = math.hypot(arc_pts[0][0] - x, arc_pts[0][1] - y)
-                                if ed_1v1 < 42.0 and "lightning" not in held_k:
+                                if not enemy_low_1v1 and ed_1v1 < 42.0 and "lightning" not in held_k:
                                     away_a = math.atan2(y - arc_pts[0][1], x - arc_pts[0][0])
                                     mr, mh = me["stats"].get("radius"), me["stats"].get("height")
                                     for da in (0.55 * self.unstick_side, -0.55 * self.unstick_side, 0.0, 1.0 * self.unstick_side, -1.0 * self.unstick_side):
@@ -1526,15 +1548,52 @@ class Bot:
                                 and not any(m.get("kind") == "mech" for m in obs["mechs"])
                                 and not any(aid < 16 for aid in self.seen)
                             )
-                            best_cd = 35.0 if uncontested_cubes else 20.0
+                            best_cd = (50.0 if w8_kc else 35.0) if uncontested_cubes else (26.0 if w8_kc else 20.0)
                             for c in obs["cubes"]:
                                 cp = c["pos"]
-                                if abs(cp[2] - mz) > 4.0:
+                                if self.world is not None and w8_kc:
+                                    if abs(cp[2] - self.world.ground_z(cp[0], cp[1])) > 2.5:
+                                        continue
+                                elif abs(cp[2] - mz) > 4.0:
                                     continue
                                 cd = math.hypot(cp[0] - x, cp[1] - y)
                                 if cd <= best_cd and math.hypot(cp[0] - cx, cp[1] - cy) <= inner:
                                     best_cd = cd
                                     goal = (cp[0], cp[1])
+                    if (w8_kc and goal is None and cover is None and not hold_drop_ring
+                            and me["hp"] >= 0.45 * me["max_hp"]):
+                        # Kill-conversion chase: if a single wounded enemy mech (< 55% HP) is within 110 m
+                        # (and no other enemy mech is in self.seen), press forward to finish the kill before
+                        # it breaks LOS and regenerates!
+                        vis_m_kc = [m for m in obs["mechs"] if m.get("kind") == "mech"]
+                        seen_mech_ids = [aid for aid in self.seen if aid < 16]
+                        if len(vis_m_kc) == 1 and len(seen_mech_ids) <= 1:
+                            em_kc = vis_m_kc[0]
+                            ehp_kc = em_kc.get("hp", 1400.0)
+                            ehp_f = ehp_kc / max(1.0, em_kc.get("max_hp", 1400.0))
+                            ed_kc = math.hypot(em_kc["pos"][0] - x, em_kc["pos"][1] - y)
+                            has_lt_kc = any(w and w["kind"] == "lightning" for w in me["weapons"])
+                            want_close = 24.0 if has_lt_kc else 42.0
+                            ep_kc = em_kc["pos"]
+                            elev_ok = (self.world is None or abs(ep_kc[2] - self.world.ground_z(ep_kc[0], ep_kc[1])) <= 2.5)
+                            if (ehp_f < 0.55 and me["hp"] > ehp_kc and elev_ok
+                                    and want_close < ed_kc <= 110.0
+                                    and math.hypot(ep_kc[0] - cx, ep_kc[1] - cy) <= inner):
+                                goal = (ep_kc[0], ep_kc[1])
+                                if ehp_f < 0.35 and me["energy"] > 50.0 and me.get("grounded", True) and (has_lt_kc or ed_kc <= 75.0):
+                                    cover_boost = True
+                        elif not vis_m_kc and len(seen_mech_ids) == 1 and me["hp"] >= 0.60 * me["max_hp"]:
+                            # If a single recently wounded enemy (< 45% HP) ducked behind a corner into self.seen (< 4.0s ago),
+                            # chase its last seen position to finish the kill before it regenerates!
+                            aid = seen_mech_ids[0]
+                            st_t, spos, _ = self.seen[aid]
+                            hp_info = self.seen_hp.get(aid)
+                            if ((t - st_t) <= 4.0 and hp_info is not None and (t - hp_info[0]) <= 4.0
+                                    and hp_info[1] < 0.45):
+                                wd = math.hypot(spos[0] - x, spos[1] - y)
+                                elev_ok = (self.world is None or abs(spos[2] - self.world.ground_z(spos[0], spos[1])) <= 2.5)
+                                if elev_ok and 8.0 < wd < 85.0 and math.hypot(spos[0] - cx, spos[1] - cy) <= inner:
+                                    goal = (spos[0], spos[1])
                     if goal is None and cover is None and not hold_drop_ring:
                         crate = self.choose_crate(obs, me, cx, cy, inner)
                         if crate is not None:
@@ -1588,7 +1647,7 @@ class Bot:
             self.nav_goal = None
             return {"move": [0.0, 0.0], "boost": False, "jump": False}
 
-        if FLAGS.get("early_weapon", False) and self.loot_goal is not None and goal == self.loot_goal:
+        if (FLAGS.get("early_weapon", False) or w8_kc) and self.loot_goal is not None and goal == self.loot_goal:
             goal_d = math.hypot(goal[0] - x, goal[1] - y)
             if self.progress_anchor is None or self.progress_anchor[4] != self.loot_goal_id:
                 self.progress_anchor = (t, x, y, goal_d, self.loot_goal_id)
@@ -1695,7 +1754,12 @@ class Bot:
             tp, _, _ = self.body(m)
             dist = math.dist(src, tp)
             hp_frac = m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0))
-            s = dist * (0.5 + 0.5 * hp_frac)
+            if FLAGS.get("w8_kill_conversion", True) and m["kind"] == "mech":
+                # Continuous focus-fire execute curve: strongly favors finishing wounded targets without
+                # discontinuities or sniping 170 m targets over point-blank rushers.
+                s = dist * (0.30 + 0.70 * hp_frac)
+            else:
+                s = dist * (0.5 + 0.5 * hp_frac)
             if m["kind"] == "npc":
                 if m["id"] != farm_npc_id:
                     s += NPC_PENALTY_M

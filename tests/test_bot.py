@@ -1790,6 +1790,7 @@ class Decisions(unittest.TestCase):
         old = dict(B.FLAGS)
         B.FLAGS["laser_first"] = True
         B.FLAGS["early_weapon"] = False
+        B.FLAGS["w8_kill_conversion"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0)
@@ -2237,6 +2238,52 @@ class Decisions(unittest.TestCase):
             self.assertAlmostEqual(bot.last_near_sound[1], 1.25, places=3)
             am2 = bot.movement(o, o["self"])
             self.assertGreater(math.hypot(*am2["move"]), 0.5, "Should step into nearby tree canopy when mid combat sound is heard")
+        finally:
+            B.FLAGS.clear()
+            B.FLAGS.update(old)
+
+    def test_w8_kill_conversion_focus_fire_and_wounded_chase(self):
+        old = dict(B.FLAGS)
+        B.FLAGS.update(w8_kill_conversion=True, cover=False, fight=True)
+        try:
+            bot = B.Bot(copy.deepcopy(HELLO))
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1200.0, max_hp=1400.0, energy=80.0)
+            o["t"] = 40.0
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
+            o["cubes"] = []
+            o["pickups"] = []
+            o["crates"] = []
+            o["drops"] = []
+            o["events"] = []
+
+            # 1. Focus-fire execute prefers 25% HP enemy at 75m (s = 75 * 0.475 = 35.6) over 100% HP enemy at 50m (s = 50.0)
+            e_full = enemy(2, (x + 50.0, y, z))
+            e_low = enemy(3, (x - 75.0, y, z))
+            e_low["hp"] = 350.0
+            o["mechs"] = [e_full, e_low]
+            bot.update_memory(o)
+            tgt = bot.pick_target(o, o["self"])
+            self.assertIsNotNone(tgt)
+            self.assertEqual(tgt["id"], 3)
+
+            # 2. Single wounded enemy (< 55% HP, 70m away) triggers kill-conversion chase + boost when < 35% HP
+            bot.seen.clear()
+            bot.seen_hp.clear()
+            o["mechs"] = [e_low]
+            bot.update_memory(o)
+            am = bot.movement(o, o["self"])
+            self.assertLess(am["move"][0], -0.8, "Should chase single wounded enemy west to finish the kill")
+            self.assertTrue(am["boost"], "Should boost to finish <35% HP enemy within 75m")
+
+            # 3. Wounded memory chase when that single wounded enemy ducks behind cover (< 4.0s)
+            o["t"] = 40.5
+            o["self"]["vel"] = [-11.0, 0.0, 0.0]
+            o["mechs"] = []
+            bot.update_memory(o)
+            am_mem = bot.movement(o, o["self"])
+            self.assertLess(am_mem["move"][0], -0.8, "Should chase last seen position of single wounded enemy")
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
