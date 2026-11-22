@@ -1934,7 +1934,7 @@ class Decisions(unittest.TestCase):
         old = dict(B.FLAGS)
         B.FLAGS["early_survival"] = True
         B.FLAGS["kite"] = False
-        B.FLAGS["w9_high_ground"] = False
+        B.FLAGS["w9_squad_hunter"] = False
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
             o = make_obs(in_zone=True)
@@ -2289,22 +2289,16 @@ class Decisions(unittest.TestCase):
             B.FLAGS.clear()
             B.FLAGS.update(old)
 
-    def test_w9_high_ground_multi_tick_rooftop_climb(self):
+    def test_w9_squad_hunter_patrol_lightning_rush_and_cover_regen(self):
         old = dict(B.FLAGS)
-        B.FLAGS.update(w9_high_ground=True)
+        B.FLAGS.update(w9_squad_hunter=True, w8_kill_conversion=True, cover=False, fight=True)
         try:
             bot = B.Bot(copy.deepcopy(HELLO))
-            self.assertGreater(len(bot.world.roof_nodes), 20, "WorldMap should index climbable rooftops")
-            rx, ry, rtop, lx, ly, lgz = bot.world.roof_nodes[0]
-            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=100.0, grounded=True)
+            bot.world = None
+            o = make_obs(in_zone=True, hp=1400.0, max_hp=1400.0, energy=85.0)
             o["t"] = 25.0
-            o["self"]["pos"] = [lx, ly, lgz]
-            l_st = dict(HELLO["config"]["weapons"]["laser"])
-            o["self"]["weapons"] = [
-                o["self"]["weapons"][0],
-                {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": l_st},
-            ]
-            o["zone"].update(center=[rx, ry], radius=400.0, next_center=[rx, ry], next_radius=200.0)
+            x, y, z = o["self"]["pos"]
+            o["zone"].update(center=[x, y], radius=400.0, next_center=[x, y], next_radius=200.0)
             o["mechs"] = []
             o["cubes"] = []
             o["pickups"] = []
@@ -2312,19 +2306,34 @@ class Decisions(unittest.TestCase):
             o["drops"] = []
             o["events"] = []
 
-            # Tick 1: at launch point on ground -> jumps toward roof
+            # 1. Unarmed (gun-only) with 0 visible/seen/heard enemies actively patrols inside settle
             bot.update_memory(o)
-            a1 = bot.movement(o, o["self"])
-            self.assertTrue(a1["jump"], "Should jump from roof launch point")
-            self.assertFalse(a1["boost"], "Should not double-drain boost on grounded jump tick")
+            am_pat = bot.movement(o, o["self"])
+            self.assertGreater(math.hypot(*am_pat["move"]), 0.5, "Unarmed mech should actively patrol inside settle")
 
-            # Tick 2: airborne at +6.0m above ground (still below rtop) -> must keep jetting (boost=True)!
-            o["t"] = 25.5
-            o["self"]["grounded"] = False
-            o["self"]["pos"] = [lx, ly, lgz + 6.0]
+            # 2. Isolated 1v1 lightning rush: holding lightning at >=70% HP rushes single enemy at 65m
+            l_st = dict(HELLO["config"]["weapons"]["lightning"])
+            o["self"]["weapons"] = [
+                o["self"]["weapons"][0],
+                {"kind": "lightning", "cooldown": 0.0, "stats": l_st},
+            ]
+            e1 = enemy(4, (x + 65.0, y, z))
+            o["mechs"] = [e1]
             bot.update_memory(o)
-            a2 = bot.movement(o, o["self"])
-            self.assertTrue(a2["boost"], "Must keep jetting upward when airborne >5m above ground and below rtop")
+            am_rush = bot.movement(o, o["self"])
+            self.assertGreater(am_rush["move"][0], 0.8, "Should rush isolated 1v1 enemy at 65m when holding lightning")
+            self.assertTrue(am_rush["boost"], "Should boost to close gap into 42m lightning range")
+
+            # 3. Cover-regen ceasefire: behind cover (not exposed, not evading) at <55% HP holds fire >38m
+            o["self"]["hp"] = 600.0
+            o["t"] = 30.0
+            bot.last_damaged_t = 28.0
+            bot.cover_goal = (x, y)
+            bot.cover_exposed = False
+            bot.evading = False
+            bot.target_has_los = True
+            ac = bot.combat(o, o["self"])
+            self.assertEqual(ac["fire"], [False, False], "Should hold fire behind cover at <55% HP to trigger 5s regen")
         finally:
             B.FLAGS.clear()
             B.FLAGS.update(old)
