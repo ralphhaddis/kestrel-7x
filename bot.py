@@ -832,7 +832,7 @@ class Bot:
         """Open-field kiting when FLAGS['kite'] is enabled, no building cover is available, and a threat has LOS.
         NOTE: Keep FLAGS['kite'] = False unless decoupled from settle radius and evaluated lower than loot_goal,
         otherwise a single exposed enemy within 85 m aborts secondary weapon pickups at full HP."""
-        if not (FLAGS.get("kite", False) and self.world is not None and me["in_zone"]):
+        if not ((FLAGS.get("kite", False) or (FLAGS.get("w14_hail_mary", True) and me["hp"] < 0.55 * me["max_hp"])) and self.world is not None and me["in_zone"]):
             return None, math.inf
         x, y, z = me["pos"]
         st = me["stats"]
@@ -1536,8 +1536,8 @@ class Bot:
                         if (w4c and dist_c > COVER_REACH_M
                                 and (self.threat is not None and t - self.threat[0] < THREAT_MEMORY_S)
                                 and self.cover_exposed
-                                and (me["hp"] < 0.70 * me["max_hp"] or (w6_esc and len([m for m in obs["mechs"] if m.get("kind") == "mech"]) >= 2))
-                                and me["energy"] > 45.0):
+                                and (me["hp"] < (0.85 if FLAGS.get("w14_hail_mary", True) else 0.70) * me["max_hp"] or (w6_esc and len([m for m in obs["mechs"] if m.get("kind") == "mech"]) >= 2))
+                                and me["energy"] > 40.0):
                             cover_boost = True
                 else:
                     hold_drop_ring = False
@@ -2283,8 +2283,10 @@ class Bot:
                           and target.get("hp", 1400.0) > 140.0
                           and not self.late and not self.healing and not self.evading)
         else:
+            running_to_cover = FLAGS.get("w14_hail_mary", True) and self.cover_goal is not None and self.cover_exposed
             can_charge = (laser is not None and laser["cooldown"] <= cd_fast
                           and dist <= laser["stats"]["range"] and me["in_zone"]
+                          and not running_to_cover
                           and not self.late and not self.healing and not self.evading)
         laser_primary = laser is not None and dist <= laser["stats"]["range"] and (
             laser.get("charge", 0) > 0 or can_charge)
