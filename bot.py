@@ -56,8 +56,9 @@ FLAGS = {
     "w11_combat_juke": False, # W11-1: 135m supply drop chase (4.00 vs 4.09; keep False, fold 0.45s juke into w12)
     "w12_bullet_evade": False, # W12-1: bullet sidestep + cover-regen hold (3.93 vs 4.09; keep False)
     "w13_squad_endurance": True, # W13-1: distant-enemy-safe weapon hunt (>65m, pickup >50m from enemies), small-zone lightning swap (30m), gun_damage/rate upgrade priority
+    "w14_hail_mary": True,     # W14: nanites-first full-HP cover-reset loop + 10-cube snowball + mortar/laser/lightning all-weapons + aggressive full-heal drops
     # Keep the flags below False (verified in upgraded strong-lobby & 1-copy ablations):
-    "aggressive_drops": False, # W4-3: 150m drop chase/contest (-0.24 ± 0.18 SE, 4/8/0 pairs in upgraded Mirror)
+    "aggressive_drops": True,  # W14: full-heal + 3-cube supply drop capture!
     "early_weapon": False,    # 85 m pickup detour (-0.27 in 1-copy sim; -0.21 official: 2.94 -> 2.73)
     "safe_laser": False,      # gate laser charge on LOS, no cover_goal, hp>140 (-0.23 pts in 1-copy sim: 9.02 vs 9.25)
     "heal": False,            # HEAL_COVER ceasefire (-0.44 pts in 1-copy sim)
@@ -326,9 +327,9 @@ class Bot:
                     "laser_pierce": 62,
                 }
                 non_weapon_scores = {
+                    "nanites": (104 if nanites_stacks == 0 else 96) if FLAGS.get("w14_hail_mary", True) else (94 if nanites_stacks == 0 else 88),
                     "armor": 100,
                     "plating": 98,
-                    "nanites": 94 if nanites_stacks == 0 else 88,
                     "sensors": 76 if alive > 8 else 58,
                     "servos": 65,
                     "gyros": 56,
@@ -387,11 +388,18 @@ class Bot:
         """Context-aware value of a secondary weapon kind."""
         if FLAGS.get("laser_first", True):
             small = obs["zone"]["next_radius"] <= 70.0
-            scores = {
-                "laser": 30.0 if small else 40.0,
-                "lightning": 38.0 if small else 30.0,
-                "mortar": 10.0,
-            }
+            if FLAGS.get("w14_hail_mary", True):
+                scores = {
+                    "laser": 32.0 if small else 42.0,
+                    "mortar": 30.0 if small else 35.0,
+                    "lightning": 40.0 if small else 28.0,
+                }
+            else:
+                scores = {
+                    "laser": 30.0 if small else 40.0,
+                    "lightning": 38.0 if small else 30.0,
+                    "mortar": 10.0,
+                }
             return scores.get(kind, 0.0)
         scores = {"laser": 30.0, "lightning": 22.0, "mortar": 18.0}
         if obs["zone"]["next_radius"] <= 70.0:
@@ -430,7 +438,7 @@ class Bot:
         held = {w["kind"] for w in me["weapons"] if w}
         use_lf = FLAGS.get("laser_first", True)
         want_kinds = set(LOOT_PREF)
-        if FLAGS.get("mortar", True) and not use_lf:
+        if FLAGS.get("mortar", True) and (not use_lf or FLAGS.get("w14_hail_mary", True)):
             want_kinds.add("mortar")
         x, y, z = me["pos"]
         zone = obs["zone"]
@@ -531,7 +539,7 @@ class Bot:
                     continue
             else:
                 if use_lf and w8_kc:
-                    kind_max_d = 130.0 if pk == "laser" else (95.0 if pk == "lightning" else LOOT_DETOUR_M)
+                    kind_max_d = 130.0 if pk == "laser" else (115.0 if (pk == "mortar" and FLAGS.get("w14_hail_mary", True)) else (95.0 if pk == "lightning" else LOOT_DETOUR_M))
                 elif use_lf and w6_loot:
                     kind_max_d = 85.0 if pk == "laser" else (62.0 if pk == "lightning" else LOOT_DETOUR_M)
                 else:
@@ -668,7 +676,14 @@ class Bot:
             proactive = self.healing or reloading or enemy_charging or len(vis_enemies) >= 2
         elif FLAGS.get("w7_squad_survival", True):
             vis_enemies = [m for m in obs["mechs"] if m.get("kind") == "mech"]
-            if FLAGS.get("w12_bullet_evade", True):
+            if FLAGS.get("w14_hail_mary", True) and vis_enemies:
+                min_ef = min(m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)) for m in vis_enemies)
+                # Proactively break LOS behind cover whenever HP < 58% (1v1) or < 85% (1v2+) to trigger nanites regen!
+                proactive = (
+                    (me["hp"] < 0.58 * me["max_hp"] and min_ef >= 0.28)
+                    or (len(vis_enemies) >= 2 and me["hp"] < 0.88 * me["max_hp"])
+                )
+            elif FLAGS.get("w12_bullet_evade", True):
                 near_vis = [m for m in vis_enemies if math.hypot(m["pos"][0] - x, m["pos"][1] - y) <= 150.0]
                 if len(near_vis) >= 2:
                     min_ef = min(m.get("hp", 1400.0) / max(1.0, m.get("max_hp", 1400.0)) for m in near_vis)
@@ -1245,12 +1260,15 @@ class Bot:
         """Select a nearby ground crate to farm when zero enemies are around."""
         if not (FLAGS.get("farm_crate", True) and me["in_zone"] and not self.late
                 and not self.evading and self.cover_goal is None
-                and me["hp"] >= me["max_hp"] - 1.0):
+                and me["hp"] >= (0.70 if FLAGS.get("w14_hail_mary", True) else 0.999) * me["max_hp"]):
             return None
         t = obs["t"]
         cubes = me.get("cubes", 0)
         w7_sq = FLAGS.get("w7_squad_survival", True)
-        if w7_sq:
+        if FLAGS.get("w14_hail_mary", True):
+            if cubes >= 10:
+                return None
+        elif w7_sq:
             if FLAGS.get("w8_kill_conversion", True):
                 if not (cubes == 0 or (cubes < 6 and t < 110.0) or (None in me["weapons"] and cubes < 8)):
                     return None
@@ -1277,7 +1295,7 @@ class Bot:
         st = me["stats"]
         mr, mh = st.get("radius"), st.get("height")
         best = None
-        best_d = 55.0
+        best_d = 80.0 if FLAGS.get("w14_hail_mary", True) else 55.0
         for c in obs.get("crates", ()):
             cid = c["id"]
             if cid in self.bad_crates:
@@ -1391,7 +1409,8 @@ class Bot:
         """Select a nearby ground-level NPC to farm for cubes when completely safe from enemy mechs."""
         if not (FLAGS.get("farm_npc", True) and me["in_zone"] and not self.late
                 and not self.evading and self.cover_goal is None
-                and me["hp"] >= 0.80 * me["max_hp"] and me.get("cubes", 0) < 6):
+                and me["hp"] >= (0.65 if FLAGS.get("w14_hail_mary", True) else 0.80) * me["max_hp"]
+                and me.get("cubes", 0) < (10 if FLAGS.get("w14_hail_mary", True) else 6)):
             return None
         t = obs["t"]
         if any(m.get("kind") == "mech" for m in obs["mechs"]):
@@ -1502,14 +1521,14 @@ class Bot:
                 cover = self.choose_cover(obs, me, cx, cy, inner)
                 if cover is not None:
                     dist_c = math.hypot(cover[0] - x, cover[1] - y)
-                    if ((w9_sh or FLAGS.get("w12_bullet_evade", True)) and self.cover_goal is not None
+                    if ((w9_sh or FLAGS.get("w12_bullet_evade", True) or FLAGS.get("w14_hail_mary", True)) and self.cover_goal is not None
                             and not self.cover_exposed
-                            and me["hp"] < (0.72 if FLAGS.get("w12_bullet_evade", True) else 0.55) * me["max_hp"]
-                            and (t - self.last_damaged_t) >= 0.8
-                            and not any(m.get("kind") == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 32.0 for m in obs["mechs"])):
+                            and me["hp"] < (0.85 if FLAGS.get("w14_hail_mary", True) else (0.72 if FLAGS.get("w12_bullet_evade", True) else 0.55)) * me["max_hp"]
+                            and (t - self.last_damaged_t) >= 0.6
+                            and not any(m.get("kind") == "mech" and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 28.0 for m in obs["mechs"])):
                         # Behind cover with low HP: extend cover_until so we stay behind the wall
-                        # long enough to trigger 5s out-of-combat HP regeneration (+45..72 HP/s)!
-                        self.cover_until = max(self.cover_until, t + 1.5)
+                        # long enough to trigger 5s/3.5s out-of-combat HP regeneration (+45..72 HP/s)!
+                        self.cover_until = max(self.cover_until, t + 2.0)
                     if dist_c <= COVER_REACH_M and (not self.cover_exposed or (w4c and self.cover_goal_exposed)):
                         goal = None
                     else:
@@ -1669,7 +1688,7 @@ class Bot:
                                 and not any(m.get("kind") == "mech" for m in obs["mechs"])
                                 and not any(aid < 16 for aid in self.seen)
                             )
-                            best_cd = (50.0 if w8_kc else 35.0) if uncontested_cubes else (26.0 if w8_kc else 20.0)
+                            best_cd = (90.0 if FLAGS.get("w14_hail_mary", True) else (50.0 if w8_kc else 35.0)) if uncontested_cubes else (35.0 if FLAGS.get("w14_hail_mary", True) else (26.0 if w8_kc else 20.0))
                             for c in obs["cubes"]:
                                 cp = c["pos"]
                                 if self.world is not None and w8_kc:
